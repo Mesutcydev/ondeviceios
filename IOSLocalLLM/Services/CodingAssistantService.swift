@@ -1459,8 +1459,12 @@ final class CodingAssistantService: ObservableObject {
         let measuredWeightBytes = stagedDirectory.map {
             Self.sumWeightFiles(in: $0)
         } ?? 0
+        let capabilityProfile = ModelCapabilityProfile.resolve(for: activeModel)
         let measuredFootprintBytes: Int64? = measuredWeightBytes > 0
-            ? Int64(Double(measuredWeightBytes) * MemoryAdvisor.workingSetOverhead)
+            ? MemoryAdvisor.estimatedPeakFootprint(
+                weightBytes: Int64(measuredWeightBytes),
+                profile: capabilityProfile
+            )
             : nil
 
         // Combined device-safety gate — covers RAM, live free memory, thermal
@@ -1479,7 +1483,7 @@ final class CodingAssistantService: ObservableObject {
             ) {
             state = .failed(block)
             RuntimeLogCenter.emit(
-                "Memory/safety gate blocked \(activeModel.displayName) · weights=\(Int64(measuredWeightBytes).formattedBytes) · estimatedPeak=\(measuredFootprintBytes?.formattedBytes ?? "unknown") · \(block)",
+                "Memory/safety gate blocked \(activeModel.displayName) · weights=\(Int64(measuredWeightBytes).formattedBytes) · estimatedPeak=\(measuredFootprintBytes?.formattedBytes ?? "unknown") · kv=\(capabilityProfile.maximumKVCacheTokens) tokens · \(block)",
                 level: .error,
                 subsystem: "model"
             )

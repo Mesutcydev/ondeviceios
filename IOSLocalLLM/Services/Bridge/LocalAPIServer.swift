@@ -110,6 +110,33 @@ struct LocalAPIToolCall: Equatable, Sendable {
     let argumentsJSON: String
 }
 
+enum LocalAPIToolCallFailure: Equatable, Sendable {
+    case unavailableTool(String)
+    case malformed(dialect: String, rawPreview: String)
+    case requiredToolMissing
+
+    func message(declaredTools: [String]) -> String {
+        switch self {
+        case .unavailableTool(let name):
+            let available = declaredTools.isEmpty
+                ? "none"
+                : declaredTools.joined(separator: ", ")
+            return "The model requested unavailable tool '\(name)'. Declared tools: \(available)."
+        case .malformed(let dialect, let rawPreview):
+            return "The server could not parse the model's \(dialect) tool-call output. "
+                + "This is a server-side parser error. Raw output preview: \(rawPreview)"
+        case .requiredToolMissing:
+            return "The request required a tool call, but the model did not produce one."
+        }
+    }
+}
+
+struct LocalAPIToolCallParseResult: Equatable, Sendable {
+    let calls: [LocalAPIToolCall]
+    let failure: LocalAPIToolCallFailure?
+    let dialect: String
+}
+
 enum LocalAPIReasoningPreference: Equatable, Sendable {
     case automatic
     case enabled
@@ -1634,22 +1661,58 @@ enum LocalAPIToolCalling {
         maximumCalls: Int? = nil,
         attemptRepair: Bool = true
     ) -> [LocalAPIToolCall] {
+        parseResult(
+            output,
+            tools: tools,
+            parallelToolCalls: parallelToolCalls,
+            validateSchemas: validateSchemas,
+            parser: parser,
+            maximumCalls: maximumCalls,
+            attemptRepair: attemptRepair
+        ).calls
+    }
+
+    static func parseResult(
+        _ output: String,
+        tools: [LocalAPIToolDefinition],
+        parallelToolCalls: Bool,
+        validateSchemas: Bool = true,
+        parser: ModelToolParser = .hermes,
+        maximumCalls: Int? = nil,
+        attemptRepair: Bool = true
+    ) -> LocalAPIToolCallParseResult {
         let toolsByName = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
-        guard !toolsByName.isEmpty else { return [] }
+        guard !toolsByName.isEmpty else {
+            return LocalAPIToolCallParseResult(calls: [], failure: nil, dialect: "none")
+        }
 
         let callLimit = max(1, maximumCalls ?? (parallelToolCalls ? 4 : 1))
         var parsedCalls: [LocalAPIToolCall] = []
         /// Well-formed calls to a known tool that only failed schema validation.
         var schemaRejectedCalls: [LocalAPIToolCall] = []
         let cleanedOutput = LocalAPIReasoningFilter.removingReasoning(from: output)
-        if parser == .qwen3XML || parser == .qwen3Coder {
-            parsedCalls.append(contentsOf: xmlFunctionCalls(
+        let dialect = detectedDialect(in: cleanedOutput)
+        var unavailableToolNames: [String] = []
+        var foundToolEnvelope = containsToolCallEnvelope(cleanedOutput)
+
+        // The registered parser is a prompt/template hint, not a guarantee
+        // about what an imported fine-tune emits. Sniff the actual payload so
+        // a Hermes-registered Qwen3-Coder derivative still works.
+        let xmlResult = xmlFunctionCalls(
                 in: cleanedOutput,
                 toolsByName: toolsByName,
                 validateSchemas: validateSchemas
-            ))
+            )
+        if xmlResult.foundEnvelope {
+            foundToolEnvelope = true
+            parsedCalls.append(contentsOf: xmlResult.calls)
+            unavailableToolNames.append(contentsOf: xmlResult.unavailableToolNames)
             if parsedCalls.count >= callLimit {
-                return Array(parsedCalls.prefix(callLimit))
+                return LocalAPIToolCallParseResult(
+                    calls: Array(parsedCalls.prefix(callLimit)),
+                    failure: nil,
+                    dialect: dialect
+                )
             }
         }
         for data in candidateJSONObjects(in: cleanedOutput) {
@@ -1665,13 +1728,19 @@ enum LocalAPIToolCalling {
 
             for rawCall in rawCalls {
                 let function = rawCall["function"] as? [String: Any] ?? rawCall
-                guard let name = function["name"] as? String,
-                      let tool = toolsByName[name],
+                guard let rawName = function["name"] as? String else {
+                    continue
+                }
+                let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let tool = toolsByName[name],
                       let argumentsJSON = normalizedArguments(
                         function["arguments"]
                             ?? function["parameters"]
                             ?? function["args"]
                       ) else {
+                    if !toolsByName.keys.contains(name), !name.isEmpty {
+                        unavailableToolNames.append(name)
+                    }
                     continue
                 }
                 let call = LocalAPIToolCall(
@@ -1686,14 +1755,20 @@ enum LocalAPIToolCalling {
                     continue
                 }
                 parsedCalls.append(call)
-                if parsedCalls.count >= callLimit { return Array(parsedCalls.prefix(callLimit)) }
+                if parsedCalls.count >= callLimit {
+                    return LocalAPIToolCallParseResult(
+                        calls: Array(parsedCalls.prefix(callLimit)),
+                        failure: nil,
+                        dialect: dialect
+                    )
+                }
             }
         }
         if parsedCalls.isEmpty,
            attemptRepair,
            let repaired = repairedToolEnvelope(cleanedOutput),
            repaired != cleanedOutput {
-            let repairedCalls = parse(
+            let repairedCalls = parseResult(
                 repaired,
                 tools: tools,
                 parallelToolCalls: parallelToolCalls,
@@ -1702,7 +1777,7 @@ enum LocalAPIToolCalling {
                 maximumCalls: maximumCalls,
                 attemptRepair: false
             )
-            if !repairedCalls.isEmpty { return repairedCalls }
+            if !repairedCalls.calls.isEmpty { return repairedCalls }
         }
         // A named call to a real tool that only fails its schema is still a
         // tool call. Dropping it turned one extra key into a 502 and told the
@@ -1714,18 +1789,62 @@ enum LocalAPIToolCalling {
                 level: .error,
                 subsystem: "api"
             )
-            return Array(schemaRejectedCalls.prefix(callLimit))
+            return LocalAPIToolCallParseResult(
+                calls: Array(schemaRejectedCalls.prefix(callLimit)),
+                failure: nil,
+                dialect: dialect
+            )
         }
-        if parsedCalls.isEmpty, containsToolCallEnvelope(output) {
+        if parsedCalls.isEmpty, let unavailable = unavailableToolNames.first {
+            RuntimeLogCenter.emit(
+                "Tool call named unavailable tool · parser=\(parser.rawValue) · "
+                    + "tool=\(unavailable) · tools=\(tools.map(\.name).joined(separator: ","))",
+                level: .error,
+                subsystem: "api"
+            )
+            return LocalAPIToolCallParseResult(
+                calls: [],
+                failure: .unavailableTool(unavailable),
+                dialect: dialect
+            )
+        }
+        if parsedCalls.isEmpty, foundToolEnvelope {
+            let detectedDialect = dialect == "none" ? "unknown" : dialect
+            let rawPreview = String(output.prefix(200))
             RuntimeLogCenter.emit(
                 "Tool call parsing failed · parser=\(parser.rawValue) · "
+                    + "dialect=\(detectedDialect) · "
                     + "tools=\(tools.map(\.name).joined(separator: ",")) · "
                     + "raw=\(output.prefix(600))",
                 level: .error,
                 subsystem: "api"
             )
+            return LocalAPIToolCallParseResult(
+                calls: [],
+                failure: .malformed(
+                    dialect: detectedDialect,
+                    rawPreview: rawPreview
+                ),
+                dialect: detectedDialect
+            )
         }
-        return Array(parsedCalls.prefix(callLimit))
+        return LocalAPIToolCallParseResult(
+            calls: Array(parsedCalls.prefix(callLimit)),
+            failure: nil,
+            dialect: dialect
+        )
+    }
+
+    static func toolCallErrorMessage(
+        for result: LocalAPIToolCallParseResult,
+        tools: [LocalAPIToolDefinition]
+    ) -> String {
+        guard let failure = result.failure else {
+            return LocalAPIToolCallFailure.requiredToolMissing.message(
+                declaredTools: tools.map(\.name)
+            )
+        }
+        return failure.message(declaredTools: tools.map(\.name))
     }
 
     static func textResponse(from output: String) -> String? {
@@ -1749,9 +1868,7 @@ enum LocalAPIToolCalling {
     }
 
     static let invalidToolCallMessage =
-        "The on-device model did not produce a tool call this request could use. "
-            + "It named no available tool, or its call could not be parsed. "
-            + "The raw model output is in the app's runtime log under the 'api' subsystem."
+        "The on-device model did not produce a usable tool call."
 
     private static func normalizedArguments(_ value: Any?) -> String? {
         if let string = value as? String,
@@ -1794,51 +1911,182 @@ enum LocalAPIToolCalling {
 
     /// Qwen3 XML-family templates emit function and parameter tags instead of
     /// JSON. Parse that native form, then normalize it into OpenAI tool calls.
+    /// The output is only XML-like: a conforming XML parser rejects tags such as
+    /// `<function=get_weather>`, so this intentionally uses a permissive scanner
+    /// backed by regular expressions.
+    private struct XMLFunctionCallResult {
+        let calls: [LocalAPIToolCall]
+        let unavailableToolNames: [String]
+        let foundEnvelope: Bool
+    }
+
     private static func xmlFunctionCalls(
         in output: String,
         toolsByName: [String: LocalAPIToolDefinition],
         validateSchemas: Bool
-    ) -> [LocalAPIToolCall] {
-        let blockPattern = #"(?s)<tool_call>\s*<function=([^>\s]+)>(.*?)</function>\s*</tool_call>"#
-        guard let blockRegex = try? NSRegularExpression(pattern: blockPattern) else { return [] }
+    ) -> XMLFunctionCallResult {
+        let blockPattern = #"(?is)<tool_call\b[^>]*>(.*?)</tool_call\s*>"#
+        guard let blockRegex = try? NSRegularExpression(pattern: blockPattern) else {
+            return XMLFunctionCallResult(calls: [], unavailableToolNames: [], foundEnvelope: false)
+        }
         let outputRange = NSRange(output.startIndex..<output.endIndex, in: output)
-        return blockRegex.matches(in: output, range: outputRange).compactMap { match in
-            guard let nameRange = Range(match.range(at: 1), in: output),
-                  let bodyRange = Range(match.range(at: 2), in: output) else { return nil }
-            let name = String(output[nameRange])
-            guard let tool = toolsByName[name] else { return nil }
-            let body = String(output[bodyRange])
-            let parameterPattern = #"(?s)<parameter=([^>\s]+)>(.*?)</parameter>"#
-            guard let parameterRegex = try? NSRegularExpression(pattern: parameterPattern) else { return nil }
-            let bodyRangeNS = NSRange(body.startIndex..<body.endIndex, in: body)
-            var arguments: [String: Any] = [:]
-            for parameter in parameterRegex.matches(in: body, range: bodyRangeNS) {
-                guard let keyRange = Range(parameter.range(at: 1), in: body),
-                      let valueRange = Range(parameter.range(at: 2), in: body) else { continue }
-                let key = String(body[keyRange])
-                let raw = String(body[valueRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if let integer = Int(raw) {
-                    arguments[key] = integer
-                } else if let number = Double(raw) {
-                    arguments[key] = number
-                } else if raw == "true" || raw == "false" {
-                    arguments[key] = raw == "true"
-                } else if let data = raw.data(using: .utf8),
-                   let value = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) {
-                    arguments[key] = value
-                } else {
-                    arguments[key] = raw
-                }
-            }
-            guard let argumentsJSON = normalizedArguments(arguments),
-                  !validateSchemas || argumentsMatchSchema(argumentsJSON, schemaJSON: tool.parametersJSON) else {
-                return nil
-            }
-            return LocalAPIToolCall(
-                id: "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))",
-                name: name,
-                argumentsJSON: argumentsJSON
+        let matches = blockRegex.matches(in: output, range: outputRange)
+        var calls: [LocalAPIToolCall] = []
+        var unavailableToolNames: [String] = []
+        let hasOpeningEnvelope = output.range(
+            of: "<tool_call",
+            options: [.caseInsensitive]
+        ) != nil
+
+        let functionPattern = "(?is)<function(?:\\s+name\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^>\\s]+))|\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^>\\s]+)))\\s*>(.*?)</function\\s*>"
+        let parameterPattern = "(?is)<parameter(?:\\s+name\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^>\\s]+))|\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^>\\s]+)))\\s*>(.*?)</parameter\\s*>"
+        guard let functionRegex = try? NSRegularExpression(pattern: functionPattern),
+              let parameterRegex = try? NSRegularExpression(pattern: parameterPattern) else {
+            return XMLFunctionCallResult(
+                calls: [],
+                unavailableToolNames: [],
+                foundEnvelope: hasOpeningEnvelope
             )
+        }
+
+        for block in matches {
+            guard let bodyRange = Range(block.range(at: 1), in: output) else { continue }
+            let body = String(output[bodyRange])
+            let bodyRangeNS = NSRange(body.startIndex..<body.endIndex, in: body)
+            for function in functionRegex.matches(in: body, range: bodyRangeNS) {
+                guard let rawName = capturedTagValue(function, in: body),
+                      let functionBodyRange = Range(function.range(at: 7), in: body) else {
+                    continue
+                }
+                let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let tool = toolsByName[name] else {
+                    if !name.isEmpty { unavailableToolNames.append(name) }
+                    continue
+                }
+
+                let functionBody = String(body[functionBodyRange])
+                let parameterRange = NSRange(
+                    functionBody.startIndex..<functionBody.endIndex,
+                    in: functionBody
+                )
+                let propertyTypes = schemaPropertyTypes(for: tool)
+                var arguments: [String: Any] = [:]
+                for parameter in parameterRegex.matches(in: functionBody, range: parameterRange) {
+                    guard let rawKey = capturedTagValue(parameter, in: functionBody),
+                          let valueRange = Range(parameter.range(at: 7), in: functionBody) else {
+                        continue
+                    }
+                    let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !key.isEmpty else { continue }
+                    let rawValue = String(functionBody[valueRange])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    arguments[key] = coerceXMLValue(
+                        rawValue,
+                        schemaType: propertyTypes[key]
+                    )
+                }
+
+                guard let argumentsJSON = normalizedArguments(arguments) else { continue }
+                if validateSchemas,
+                   !argumentsMatchSchema(argumentsJSON, schemaJSON: tool.parametersJSON) {
+                    RuntimeLogCenter.emit(
+                        "XML tool call did not fully match the declared schema; forwarding coerced values · tool=\(name)",
+                        level: .warning,
+                        subsystem: "api"
+                    )
+                }
+                calls.append(LocalAPIToolCall(
+                    id: "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))",
+                    name: name,
+                    argumentsJSON: argumentsJSON
+                ))
+            }
+        }
+        return XMLFunctionCallResult(
+            calls: calls,
+            unavailableToolNames: unavailableToolNames,
+            foundEnvelope: hasOpeningEnvelope || !matches.isEmpty
+        )
+    }
+
+    private static func capturedTagValue(
+        _ match: NSTextCheckingResult,
+        in text: String
+    ) -> String? {
+        for index in 1...6 {
+            guard match.range(at: index).location != NSNotFound,
+                  let range = Range(match.range(at: index), in: text) else {
+                continue
+            }
+            return String(text[range])
+        }
+        return nil
+    }
+
+    private static func schemaPropertyTypes(
+        for tool: LocalAPIToolDefinition
+    ) -> [String: String] {
+        guard let data = tool.parametersJSON.data(using: .utf8),
+              let schema = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let properties = schema["properties"] as? [String: Any] else {
+            return [:]
+        }
+        return properties.reduce(into: [:]) { result, entry in
+            guard let property = entry.value as? [String: Any],
+                  let type = property["type"] as? String else { return }
+            result[entry.key] = type.lowercased()
+        }
+    }
+
+    private static func coerceXMLValue(
+        _ rawValue: String,
+        schemaType: String?
+    ) -> Any {
+        switch schemaType {
+        case "number":
+            if let value = Double(rawValue), value.isFinite { return value }
+        case "integer":
+            if let value = Int(rawValue) { return value }
+        case "boolean":
+            switch rawValue.lowercased() {
+            case "true": return true
+            case "false": return false
+            default: break
+            }
+        case "object", "array":
+            if let data = rawValue.data(using: .utf8),
+               let value = try? JSONSerialization.jsonObject(
+                   with: data,
+                   options: [.fragmentsAllowed]
+               ) {
+                if schemaType == "object", value is [String: Any] { return value }
+                if schemaType == "array", value is [Any] { return value }
+            }
+        default:
+            break
+        }
+        // Failed coercion is intentionally lossless. A client can decide how
+        // to handle a schema mismatch instead of losing the whole tool call.
+        return rawValue
+    }
+
+    private static func detectedDialect(in output: String) -> String {
+        guard let opening = output.range(
+            of: "<tool_call",
+            options: [.caseInsensitive]
+        ) else {
+            return output.contains("\"tool_calls\"") ? "json" : "none"
+        }
+        let afterOpening = output[opening.upperBound...]
+        guard let tagEnd = afterOpening.firstIndex(of: ">") else { return "unknown" }
+        let payload = afterOpening[afterOpening.index(after: tagEnd)...]
+        guard let first = payload.first(where: { !$0.isWhitespace }) else {
+            return "unknown"
+        }
+        switch first {
+        case "{": return "json"
+        case "<": return "xml"
+        default: return "unknown"
         }
     }
 
@@ -2095,6 +2343,40 @@ enum LocalAPIResponse {
                 "index": 0,
                 "delta": delta,
                 "finish_reason": finishReason as Any
+            ]]
+        ])
+    }
+
+    static func openAIToolCallFragmentChunk(
+        id: String,
+        model: String,
+        index: Int,
+        callID: String?,
+        name: String?,
+        arguments: String?,
+        includeRole: Bool
+    ) -> Data {
+        var function: [String: Any] = [:]
+        if let name { function["name"] = name }
+        if let arguments { function["arguments"] = arguments }
+        var call: [String: Any] = [
+            "index": index,
+            "function": function
+        ]
+        if let callID { call["id"] = callID }
+        if name != nil { call["type"] = "function" }
+
+        var delta: [String: Any] = ["tool_calls": [call]]
+        if includeRole { delta["role"] = "assistant" }
+        return json([
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": Int(Date().timeIntervalSince1970),
+            "model": model,
+            "choices": [[
+                "index": 0,
+                "delta": delta,
+                "finish_reason": NSNull()
             ]]
         ])
     }
@@ -2398,6 +2680,7 @@ actor LocalAPIServer {
         var timedOut = false
     }
     private var activeInference: ActiveInference?
+    private var connectionKeepAlive: [ObjectIdentifier: Bool] = [:]
     // A 12 MB embedded image expands to ~16 MB in base64 plus JSON overhead.
     // Keep a finite authenticated-LAN cap while allowing one full-resolution
     // screenshot/photo request to reach the decoder.
@@ -2459,6 +2742,9 @@ actor LocalAPIServer {
 
     private func handle(_ connection: NWConnection) async {
         let connectionMonitor = LocalAPIConnectionMonitor()
+        let requestBuffer = HTTPRequestBuffer()
+        let connectionID = ObjectIdentifier(connection)
+        connectionKeepAlive[connectionID] = false
         connection.stateUpdateHandler = { state in
             switch state {
             case .failed, .cancelled:
@@ -2468,59 +2754,74 @@ actor LocalAPIServer {
             }
         }
         connection.start(queue: .global(qos: .userInitiated))
-        defer { connectionMonitor.stop() }
-        do {
-            let request = try await readRequest(connection)
-            await route(
-                request,
-                connection: connection,
-                connectionMonitor: connectionMonitor
-            )
-        } catch let error as RequestReadError {
-            let response: (Int, String) = switch error {
-            case .timedOut: (408, "Request timed out")
-            case .tooLarge: (413, "Request body is too large")
-            case .connectionClosed: (400, "Connection closed before a complete request was received")
+        defer {
+            connectionKeepAlive.removeValue(forKey: connectionID)
+            connectionMonitor.stop()
+            connection.cancel()
+        }
+        while !Task.isCancelled {
+            do {
+                let request = try await readRequest(connection, buffer: requestBuffer)
+                connectionKeepAlive[connectionID] = request.wantsKeepAlive
+                await route(
+                    request,
+                    connection: connection,
+                    connectionMonitor: connectionMonitor
+                )
+                guard connectionKeepAlive[connectionID] == true else { return }
+            } catch let error as RequestReadError {
+                let response: (Int, String) = switch error {
+                case .timedOut: (408, "Request timed out")
+                case .tooLarge: (413, "Request body is too large")
+                case .connectionClosed: (400, "Connection closed before a complete request was received")
+                }
+                await respond(
+                    connection,
+                    status: response.0,
+                    contentType: "application/json",
+                    data: LocalAPIResponse.json([
+                        "error": [
+                            "type": "invalid_request_error",
+                            "message": response.1
+                        ]
+                    ])
+                )
+                return
+            } catch {
+                await respond(
+                    connection,
+                    status: 400,
+                    contentType: "application/json",
+                    data: LocalAPIResponse.json([
+                        "error": [
+                            "type": "invalid_request_error",
+                            "message": "Malformed HTTP request"
+                        ]
+                    ])
+                )
+                return
             }
-            await respond(
-                connection,
-                status: response.0,
-                contentType: "application/json",
-                data: LocalAPIResponse.json([
-                    "error": [
-                        "type": "invalid_request_error",
-                        "message": response.1
-                    ]
-                ])
-            )
-        } catch {
-            await respond(
-                connection,
-                status: 400,
-                contentType: "application/json",
-                data: LocalAPIResponse.json([
-                    "error": [
-                        "type": "invalid_request_error",
-                        "message": "Malformed HTTP request"
-                    ]
-                ])
-            )
         }
     }
 
-    private func readRequest(_ connection: NWConnection) async throws -> HTTPRequest {
-        var buffer = Data()
+    private func readRequest(
+        _ connection: NWConnection,
+        buffer: HTTPRequestBuffer
+    ) async throws -> HTTPRequest {
         let deadline = Date().addingTimeInterval(requestTimeout)
         while true {
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else { throw RequestReadError.timedOut }
-            let chunk = try await receive(connection, timeout: remaining)
-            guard !chunk.isEmpty else { throw RequestReadError.connectionClosed }
-            buffer.append(chunk)
-            guard buffer.count <= maxRequestBytes else {
+            if let parsed = HTTPRequest.parse(data: buffer.data) {
+                buffer.data.removeFirst(parsed.consumedBytes)
+                return parsed.request
+            }
+            guard buffer.data.count <= maxRequestBytes else {
                 throw RequestReadError.tooLarge
             }
-            if let request = HTTPRequest(data: buffer) { return request }
+            let chunk = try await receive(connection, timeout: remaining)
+            guard !chunk.isEmpty else { throw RequestReadError.connectionClosed }
+            buffer.data.append(chunk)
         }
     }
 
@@ -2689,6 +2990,13 @@ actor LocalAPIServer {
             return
         }
 
+        // Finite JSON responses have a Content-Length and can reuse the
+        // HTTP/1.1 socket. Streaming responses remain close-delimited so SSE
+        // and NDJSON clients get an unambiguous end-of-response marker.
+        if decoded.stream {
+            connectionKeepAlive[ObjectIdentifier(connection)] = false
+        }
+
         // A completed token stream can reach the HTTP layer a fraction before
         // the native generation task has unwound its final cache cleanup. Wait
         // for that drain so a back-to-back Hermes request is not mistaken for
@@ -2806,7 +3114,6 @@ actor LocalAPIServer {
                 activeInference = nil
             }
             disconnectTask.cancel()
-            connectionMonitor.stop()
             deadlineTask.cancel()
             RemoteInferenceGate.shared.release(lease)
         }
@@ -2905,20 +3212,253 @@ actor LocalAPIServer {
             if toolCallingEnabled {
                 var output = ""
                 output.reserveCapacity(min(maxTokens * 4, 256 * 1_024))
+                var streamedText = ""
+                var toolReasoningFilter = LocalAPIReasoningFilter(
+                    prefilledOpening: prefilledReasoningOpen
+                )
+                var toolStartedAssistantRole = false
+                var toolStartedVisibleContent = false
+                var toolHeadersWritten = false
+                var streamsAsText = false
+
+                func emitToolTextDelta(_ delta: LocalAPIReasoningDelta) async throws {
+                    guard !delta.isEmpty else { return }
+                    if !toolHeadersWritten {
+                        await writeStreamingHeaders(
+                            connection,
+                            dialect: dialect,
+                            model: snapshot.0
+                        )
+                        toolHeadersWritten = true
+                    }
+                    streamedText += delta.content
+                    let text = delta.content.isEmpty ? delta.reasoning : delta.content
+                    let characters = Array(text)
+                    var start = 0
+                    var partIndex = 0
+                    while start < characters.count {
+                        let end = min(characters.count, start + 8)
+                        let piece = String(characters[start..<end])
+                        let reasoning = delta.content.isEmpty
+                            ? (partIndex == 0 ? piece : "")
+                            : (partIndex == 0 ? delta.reasoning : "")
+                        let payload: Data
+                        switch dialect {
+                        case .openAIChat:
+                            let role: String? = toolStartedAssistantRole
+                                ? nil
+                                : "assistant"
+                            toolStartedAssistantRole = true
+                            payload = Data("data: ".utf8) + LocalAPIResponse.openAIChunk(
+                                id: requestID,
+                                model: snapshot.0,
+                                text: delta.content.isEmpty ? "" : piece,
+                                role: role,
+                                reasoningContent: reasoning.isEmpty ? nil : reasoning
+                            ) + Data("\n\n".utf8)
+                        case .openAIResponses:
+                            guard !delta.content.isEmpty else {
+                                start = end
+                                partIndex += 1
+                                continue
+                            }
+                            toolStartedVisibleContent = true
+                            payload = LocalAPIResponse.openAIResponseEvent(
+                                "response.output_text.delta",
+                                fields: [
+                                    "response_id": requestID,
+                                    "item_id": "msg_\(requestID)",
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": piece
+                                ]
+                            )
+                        case .anthropic:
+                            guard !delta.content.isEmpty else {
+                                start = end
+                                partIndex += 1
+                                continue
+                            }
+                            let blockStart = !toolStartedVisibleContent
+                                ? LocalAPIResponse.anthropicEvent(
+                                    "content_block_start",
+                                    object: [
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": ["type": "text", "text": ""]
+                                    ]
+                                )
+                                : Data()
+                            toolStartedVisibleContent = true
+                            payload = blockStart + LocalAPIResponse.anthropicEvent(
+                                "content_block_delta",
+                                object: [
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": ["type": "text_delta", "text": piece]
+                                ]
+                            )
+                        case .ollamaChat:
+                            toolStartedAssistantRole = true
+                            payload = LocalAPIResponse.ollamaChat(
+                                model: snapshot.0,
+                                text: delta.content.isEmpty ? "" : piece,
+                                done: false,
+                                reasoningContent: reasoning
+                            ) + Data("\n".utf8)
+                        case .ollamaGenerate:
+                            toolStartedAssistantRole = true
+                            payload = LocalAPIResponse.ollamaGenerate(
+                                model: snapshot.0,
+                                text: delta.content.isEmpty ? "" : piece,
+                                done: false,
+                                reasoningContent: reasoning
+                            ) + Data("\n".utf8)
+                        }
+                        try await send(connection, payload)
+                        start = end
+                        partIndex += 1
+                    }
+                }
+
+                func finishToolTextStream() async {
+                    do {
+                        try await emitToolTextDelta(toolReasoningFilter.finish())
+                    } catch {
+                        await cancelInference()
+                        connection.cancel()
+                        return
+                    }
+                    let timedOut = activeInference?.id == inferenceID
+                        && activeInference?.timedOut == true
+                    if timedOut {
+                        try? await sendStreamingGenerationTimeout(
+                            connection,
+                            dialect: dialect
+                        )
+                        connection.cancel()
+                        return
+                    }
+                    guard LocalAPIAssistantOutputValidator.hasAnswer(
+                        text: streamedText,
+                        toolCalls: []
+                    ) else {
+                        try? await sendStreamingModelError(
+                            connection,
+                            dialect: dialect
+                        )
+                        connection.cancel()
+                        return
+                    }
+                    switch dialect {
+                    case .openAIChat:
+                        try? await sendFinal(
+                            connection,
+                            LocalAPIResponse.openAIStreamTerminator(
+                                id: requestID,
+                                model: snapshot.0,
+                                finishReason: inferenceSignal.result?.stopReason == .length
+                                    ? "length"
+                                    : "stop",
+                                usage: inferenceSignal.result.map(LocalAPIUsage.init),
+                                includeUsage: decoded.streamIncludeUsage
+                            )
+                        )
+                    case .openAIResponses:
+                        try? await send(connection, LocalAPIResponse.openAIResponseEvent(
+                            "response.output_text.done",
+                            fields: [
+                                "response_id": requestID,
+                                "item_id": "msg_\(requestID)",
+                                "output_index": 0,
+                                "content_index": 0,
+                                "text": streamedText
+                            ]
+                        ))
+                        try? await sendFinal(connection, LocalAPIResponse.openAIResponseEvent(
+                            "response.completed",
+                            fields: [
+                                "response": (try? JSONSerialization.jsonObject(
+                                    with: LocalAPIResponse.openAIResponse(
+                                        id: requestID,
+                                        model: snapshot.0,
+                                        text: streamedText,
+                                        reasoningContent: toolReasoningFilter.reasoningText
+                                    )
+                                )) ?? [:]
+                            ]
+                        ))
+                    case .anthropic:
+                        try? await send(connection, LocalAPIResponse.anthropicEvent(
+                            "content_block_stop",
+                            object: ["type": "content_block_stop", "index": 0]
+                        ))
+                        try? await send(connection, LocalAPIResponse.anthropicEvent(
+                            "message_delta",
+                            object: [
+                                "type": "message_delta",
+                                "delta": [
+                                    "stop_reason": "end_turn",
+                                    "stop_sequence": NSNull()
+                                ],
+                                "usage": ["output_tokens": 0]
+                            ]
+                        ))
+                        try? await sendFinal(connection, LocalAPIResponse.anthropicEvent(
+                            "message_stop",
+                            object: ["type": "message_stop"]
+                        ))
+                    case .ollamaChat:
+                        try? await sendFinal(
+                            connection,
+                            LocalAPIResponse.ollamaChat(
+                                model: snapshot.0,
+                                text: "",
+                                done: true,
+                                reasoningContent: toolReasoningFilter.reasoningText
+                            ) + Data("\n".utf8)
+                        )
+                    case .ollamaGenerate:
+                        try? await sendFinal(
+                            connection,
+                            LocalAPIResponse.ollamaGenerate(
+                                model: snapshot.0,
+                                text: "",
+                                done: true,
+                                reasoningContent: toolReasoningFilter.reasoningText
+                            ) + Data("\n".utf8)
+                        )
+                    }
+                    connection.cancel()
+                }
+
                 do {
                     for await token in stream {
+                        if streamsAsText {
+                            try await emitToolTextDelta(toolReasoningFilter.consume(token))
+                            continue
+                        }
                         output += token
-                        // Do not emit model tokens until the complete tool
-                        // decision is parsed. This prevents a printed
-                        // {"tool_calls": ...} envelope from escaping as
-                        // assistant prose and allows parallel calls to arrive
-                        // in one native response.
+                        // Hold only a possible opening tool envelope. Ordinary
+                        // prose with tools enabled follows the normal streaming
+                        // path immediately instead of waiting for completion.
+                        if !LocalAPIToolCalling.shouldBufferForToolDecision(output) {
+                            streamsAsText = true
+                            try await emitToolTextDelta(
+                                toolReasoningFilter.consume(output)
+                            )
+                            output.removeAll(keepingCapacity: true)
+                        }
                         if output.count > 100_000 {
                             await cancelInference()
                             break
                         }
                     }
-                    let calls = LocalAPIToolCalling.parse(
+                    if streamsAsText {
+                        await finishToolTextStream()
+                        return
+                    }
+                    let parsedToolCalls = LocalAPIToolCalling.parseResult(
                         output,
                         tools: decoded.tools,
                         parallelToolCalls: parallelLimit > 1,
@@ -2926,6 +3466,7 @@ actor LocalAPIServer {
                         parser: snapshot.7.toolParser,
                         maximumCalls: parallelLimit
                     )
+                    let calls = parsedToolCalls.calls
                     let parsedOutput = LocalAPIReasoningFilter.parse(
                         output,
                         prefilledOpening: prefilledReasoningOpen
@@ -2937,7 +3478,7 @@ actor LocalAPIServer {
                         let invalidEnvelope = LocalAPIToolCalling.containsToolCallEnvelope(output)
                         let timedOut = activeInference?.id == inferenceID
                             && activeInference?.timedOut == true
-                        if requiredTool || invalidEnvelope || timedOut {
+                        if requiredTool || invalidEnvelope || timedOut || parsedToolCalls.failure != nil {
                             // A tool decision cannot be streamed, so nothing has
                             // been written yet and the failure can still carry a
                             // real status — the same 502 the non-streaming path
@@ -2947,7 +3488,10 @@ actor LocalAPIServer {
                                 status: 502,
                                 message: timedOut
                                     ? LocalAPIInferencePolicy.toolTimeoutMessage
-                                    : LocalAPIToolCalling.invalidToolCallMessage,
+                                    : LocalAPIToolCalling.toolCallErrorMessage(
+                                        for: parsedToolCalls,
+                                        tools: decoded.tools
+                                    ),
                                 dialect: dialect
                             )
                             return
@@ -2969,21 +3513,11 @@ actor LocalAPIServer {
                             )
                             return
                         }
-                        await writeStreamingHeaders(
-                            connection,
-                            dialect: dialect,
-                            model: snapshot.0
-                        )
-                        try await sendStreamingTextCompletion(
-                            connection,
-                            dialect: dialect,
-                            model: snapshot.0,
-                            requestID: requestID,
-                            text: cleanedOutput,
-                            reasoningContent: parsedOutput.reasoning,
-                            generationResult: inferenceSignal.result,
-                            includeUsage: decoded.streamIncludeUsage
-                        )
+                        try await emitToolTextDelta(LocalAPIReasoningDelta(
+                            reasoning: parsedOutput.reasoning,
+                            content: cleanedOutput
+                        ))
+                        await finishToolTextStream()
                     } else {
                         await writeStreamingHeaders(
                             connection,
@@ -2992,16 +3526,39 @@ actor LocalAPIServer {
                         )
                         switch dialect {
                         case .openAIChat:
-                            try await send(
-                                connection,
-                                Data("data: ".utf8)
-                                    + LocalAPIResponse.openAIToolCallChunk(
-                                        id: requestID,
-                                        model: snapshot.0,
-                                        calls: calls
+                            for (index, call) in calls.enumerated() {
+                                try await send(
+                                    connection,
+                                    Data("data: ".utf8)
+                                        + LocalAPIResponse.openAIToolCallFragmentChunk(
+                                            id: requestID,
+                                            model: snapshot.0,
+                                            index: index,
+                                            callID: call.id,
+                                            name: call.name,
+                                            arguments: "",
+                                            includeRole: index == 0
+                                        )
+                                        + Data("\n\n".utf8)
+                                )
+                                guard call.argumentsJSON.isEmpty else {
+                                    try await send(
+                                        connection,
+                                        Data("data: ".utf8)
+                                            + LocalAPIResponse.openAIToolCallFragmentChunk(
+                                                id: requestID,
+                                                model: snapshot.0,
+                                                index: index,
+                                                callID: nil,
+                                                name: nil,
+                                                arguments: call.argumentsJSON,
+                                                includeRole: false
+                                            )
+                                            + Data("\n\n".utf8)
                                     )
-                                    + Data("\n\n".utf8)
-                            )
+                                    continue
+                                }
+                            }
                             try await sendFinal(
                                 connection,
                                 LocalAPIResponse.openAIStreamTerminator(
@@ -3055,77 +3612,104 @@ actor LocalAPIServer {
             var startedAssistantRole = false
             var startedVisibleContent = false
 
+            func splitStreamingDelta(
+                _ delta: LocalAPIReasoningDelta,
+                maximumCharacters: Int = 8
+            ) -> [LocalAPIReasoningDelta] {
+                guard !delta.content.isEmpty || !delta.reasoning.isEmpty else {
+                    return []
+                }
+                let text = delta.content.isEmpty ? delta.reasoning : delta.content
+                let characters = Array(text)
+                var result: [LocalAPIReasoningDelta] = []
+                var start = 0
+                while start < characters.count {
+                    let end = min(characters.count, start + maximumCharacters)
+                    let piece = String(characters[start..<end])
+                    result.append(LocalAPIReasoningDelta(
+                        reasoning: delta.content.isEmpty && result.isEmpty
+                            ? piece
+                            : delta.content.isEmpty ? "" : result.isEmpty ? delta.reasoning : "",
+                        content: delta.content.isEmpty ? "" : piece
+                    ))
+                    start = end
+                }
+                return result
+            }
+
             func emitOpenAICompatibleDelta(
                 _ delta: LocalAPIReasoningDelta
             ) async throws {
                 guard !delta.isEmpty else { return }
                 streamedOutput += delta.content
-                let reasoningContent = delta.reasoning.isEmpty
-                    ? nil
-                    : delta.reasoning
-                let payload: Data
-                switch dialect {
-                case .openAIChat:
-                    let role: String? = startedAssistantRole ? nil : "assistant"
-                    startedAssistantRole = true
-                    payload = Data("data: ".utf8) + LocalAPIResponse.openAIChunk(
-                        id: requestID,
-                        model: snapshot.0,
-                        text: delta.content,
-                        role: role,
-                        reasoningContent: reasoningContent
-                    ) + Data("\n\n".utf8)
-                case .openAIResponses:
-                    // Responses API streams visible text only; reasoning is
-                    // attached on the completed response object.
-                    guard !delta.content.isEmpty else { return }
-                    startedVisibleContent = true
-                    payload = LocalAPIResponse.openAIResponseEvent(
-                        "response.output_text.delta",
-                        fields: [
-                            "response_id": requestID,
-                            "item_id": "msg_\(requestID)",
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": delta.content
-                        ]
-                    )
-                case .anthropic:
-                    guard !delta.content.isEmpty else { return }
-                    let start = !startedVisibleContent
-                        ? LocalAPIResponse.anthropicEvent("content_block_start", object: [
-                            "type": "content_block_start",
-                            "index": 0,
-                            "content_block": ["type": "text", "text": ""]
-                        ])
-                        : Data()
-                    startedVisibleContent = true
-                    payload = start + LocalAPIResponse.anthropicEvent(
-                        "content_block_delta",
-                        object: [
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": ["type": "text_delta", "text": delta.content]
-                        ]
-                    )
-                case .ollamaChat:
-                    startedAssistantRole = true
-                    payload = LocalAPIResponse.ollamaChat(
-                        model: snapshot.0,
-                        text: delta.content,
-                        done: false,
-                        reasoningContent: reasoningContent ?? ""
-                    ) + Data("\n".utf8)
-                case .ollamaGenerate:
-                    startedAssistantRole = true
-                    payload = LocalAPIResponse.ollamaGenerate(
-                        model: snapshot.0,
-                        text: delta.content,
-                        done: false,
-                        reasoningContent: reasoningContent ?? ""
-                    ) + Data("\n".utf8)
+                for part in splitStreamingDelta(delta) {
+                    let reasoningContent = part.reasoning.isEmpty
+                        ? nil
+                        : part.reasoning
+                    let payload: Data
+                    switch dialect {
+                    case .openAIChat:
+                        let role: String? = startedAssistantRole ? nil : "assistant"
+                        startedAssistantRole = true
+                        payload = Data("data: ".utf8) + LocalAPIResponse.openAIChunk(
+                            id: requestID,
+                            model: snapshot.0,
+                            text: part.content,
+                            role: role,
+                            reasoningContent: reasoningContent
+                        ) + Data("\n\n".utf8)
+                    case .openAIResponses:
+                        // Responses API streams visible text only; reasoning is
+                        // attached on the completed response object.
+                        guard !part.content.isEmpty else { continue }
+                        startedVisibleContent = true
+                        payload = LocalAPIResponse.openAIResponseEvent(
+                            "response.output_text.delta",
+                            fields: [
+                                "response_id": requestID,
+                                "item_id": "msg_\(requestID)",
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": part.content
+                            ]
+                        )
+                    case .anthropic:
+                        guard !part.content.isEmpty else { continue }
+                        let start = !startedVisibleContent
+                            ? LocalAPIResponse.anthropicEvent("content_block_start", object: [
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": ["type": "text", "text": ""]
+                            ])
+                            : Data()
+                        startedVisibleContent = true
+                        payload = start + LocalAPIResponse.anthropicEvent(
+                            "content_block_delta",
+                            object: [
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": ["type": "text_delta", "text": part.content]
+                            ]
+                        )
+                    case .ollamaChat:
+                        startedAssistantRole = true
+                        payload = LocalAPIResponse.ollamaChat(
+                            model: snapshot.0,
+                            text: part.content,
+                            done: false,
+                            reasoningContent: reasoningContent ?? ""
+                        ) + Data("\n".utf8)
+                    case .ollamaGenerate:
+                        startedAssistantRole = true
+                        payload = LocalAPIResponse.ollamaGenerate(
+                            model: snapshot.0,
+                            text: part.content,
+                            done: false,
+                            reasoningContent: reasoningContent ?? ""
+                        ) + Data("\n".utf8)
+                    }
+                    try await send(connection, payload)
                 }
-                try await send(connection, payload)
             }
 
             // Prefill on a long prompt can run for many seconds before the
@@ -3263,8 +3847,8 @@ actor LocalAPIServer {
             )
             let cleanedOutput = LocalAPIToolCalling.textResponse(from: output)
                 ?? parsedOutput.content
-            let detectedCalls = toolCallingEnabled
-                ? LocalAPIToolCalling.parse(
+            let parsedToolCalls = toolCallingEnabled
+                ? LocalAPIToolCalling.parseResult(
                     output,
                     tools: decoded.tools,
                     parallelToolCalls: parallelLimit > 1,
@@ -3272,7 +3856,8 @@ actor LocalAPIServer {
                     parser: snapshot.7.toolParser,
                     maximumCalls: parallelLimit
                 )
-                : []
+                : LocalAPIToolCallParseResult(calls: [], failure: nil, dialect: "none")
+            let detectedCalls = parsedToolCalls.calls
             let timedOut = activeInference?.id == inferenceID
                 && activeInference?.timedOut == true
             if timedOut, !toolCallingEnabled {
@@ -3289,6 +3874,7 @@ actor LocalAPIServer {
                 && (
                     decoded.toolChoice != .auto
                         || LocalAPIToolCalling.containsToolCallEnvelope(output)
+                        || parsedToolCalls.failure != nil
                         || timedOut
                 )
             if invalidToolResponse {
@@ -3297,7 +3883,10 @@ actor LocalAPIServer {
                     status: 502,
                     message: timedOut
                         ? LocalAPIInferencePolicy.toolTimeoutMessage
-                        : LocalAPIToolCalling.invalidToolCallMessage,
+                        : LocalAPIToolCalling.toolCallErrorMessage(
+                            for: parsedToolCalls,
+                            tools: decoded.tools
+                        ),
                     dialect: dialect
                 )
                 return
@@ -4089,6 +4678,7 @@ actor LocalAPIServer {
         dialect: Dialect,
         model: String
     ) async {
+        connectionKeepAlive[ObjectIdentifier(connection)] = false
         let contentType = (dialect == .openAIChat || dialect == .openAIResponses || dialect == .anthropic)
             ? "text/event-stream"
             : "application/x-ndjson"
@@ -4165,15 +4755,26 @@ actor LocalAPIServer {
         header += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
         header += "Access-Control-Allow-Headers: Authorization, Content-Type, X-API-Key, Anthropic-Version, Anthropic-Beta\r\n"
         header += "Access-Control-Allow-Private-Network: true\r\n"
-        header += "Connection: close\r\n\r\n"
+        let keepAlive = connectionKeepAlive[ObjectIdentifier(connection)] == true
+        header += keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n"
+        if keepAlive {
+            header += "Keep-Alive: timeout=30\r\n"
+        }
+        header += "\r\n"
         var payload = Data(header.utf8)
         payload.append(data)
-        try? await sendFinal(connection, payload)
+        if keepAlive {
+            try? await send(connection, payload)
+        } else {
+            try? await sendFinal(connection, payload)
+        }
         RuntimeLogCenter.emit(
             "HTTP response \(status) (\(data.count) bytes)",
             subsystem: "api"
         )
-        connection.cancel()
+        if !keepAlive {
+            connection.cancel()
+        }
     }
 
     private func send(_ connection: NWConnection, _ data: Data) async throws {
@@ -4213,15 +4814,31 @@ actor LocalAPIServer {
 struct HTTPRequest {
     let method: String
     let path: String
+    let version: String
     let headers: [String: String]
     let body: Data?
 
     init?(data: Data) {
+        guard let parsed = Self.parse(data: data) else { return nil }
+        self = parsed.request
+    }
+
+    var wantsKeepAlive: Bool {
+        let tokens = headers["connection"]?
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            ?? []
+        if tokens.contains("close") { return false }
+        if version.uppercased() == "HTTP/1.1" { return true }
+        return tokens.contains("keep-alive")
+    }
+
+    fileprivate static func parse(data: Data) -> (request: Self, consumedBytes: Int)? {
         let separator = Data("\r\n\r\n".utf8)
         guard let separatorRange = data.range(of: separator),
               let headerSection = String(
-                data: data[..<separatorRange.lowerBound],
-                encoding: .utf8
+                  data: data[..<separatorRange.lowerBound],
+                  encoding: .utf8
               ) else {
             return nil
         }
@@ -4236,10 +4853,11 @@ struct HTTPRequest {
             omittingEmptySubsequences: true
         )
         guard parts.count >= 2 else { return nil }
-        method = String(parts[0]).uppercased()
 
+        let method = String(parts[0]).uppercased()
         let rawPath = String(parts[1])
-        path = rawPath.split(separator: "?", maxSplits: 1).first.map(String.init) ?? ""
+        let path = rawPath.split(separator: "?", maxSplits: 1).first.map(String.init) ?? ""
+        let version = parts.count >= 3 ? String(parts[2]) : "HTTP/1.0"
 
         var parsedHeaders: [String: String] = [:]
         for line in lines {
@@ -4252,23 +4870,50 @@ struct HTTPRequest {
             guard !key.isEmpty else { continue }
             parsedHeaders[key] = value
         }
-        headers = parsedHeaders
 
         let headerByteCount = separatorRange.upperBound
         let declaredLength = Int(parsedHeaders["content-length"] ?? "0") ?? 0
-        guard declaredLength >= 0 else { return nil }
-        guard data.count >= headerByteCount + declaredLength else { return nil }
-        body = declaredLength == 0
+        guard declaredLength >= 0,
+              data.count >= headerByteCount + declaredLength else {
+            return nil
+        }
+        let body = declaredLength == 0
             ? nil
             : Data(data[headerByteCount..<(headerByteCount + declaredLength)])
+        let request = Self(
+            method: method,
+            path: path,
+            version: version,
+            headers: parsedHeaders,
+            body: body
+        )
+        return (request, headerByteCount + declaredLength)
     }
+
+    private init(
+        method: String,
+        path: String,
+        version: String,
+        headers: [String: String],
+        body: Data?
+    ) {
+        self.method = method
+        self.path = path
+        self.version = version
+        self.headers = headers
+        self.body = body
+    }
+}
+
+private final class HTTPRequestBuffer: @unchecked Sendable {
+    var data = Data()
 }
 
 final class LocalAPIConnectionMonitor: @unchecked Sendable {
     private let lock = NSLock()
     private var disconnected = false
     private var stopped = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     func markDisconnected() {
         lock.lock()
@@ -4277,7 +4922,7 @@ final class LocalAPIConnectionMonitor: @unchecked Sendable {
             return
         }
         disconnected = true
-        let pending = waiters
+        let pending = Array(waiters.values)
         waiters.removeAll(keepingCapacity: false)
         lock.unlock()
         pending.forEach { $0.resume() }
@@ -4290,28 +4935,36 @@ final class LocalAPIConnectionMonitor: @unchecked Sendable {
             return
         }
         stopped = true
-        let pending = waiters
+        let pending = Array(waiters.values)
         waiters.removeAll(keepingCapacity: false)
         lock.unlock()
         pending.forEach { $0.resume() }
     }
 
     func wait() async {
+        let waiterID = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation {
                 (continuation: CheckedContinuation<Void, Never>) in
                 lock.lock()
-                if disconnected || stopped {
+                if disconnected || stopped || Task.isCancelled {
                     lock.unlock()
                     continuation.resume()
                 } else {
-                    waiters.append(continuation)
+                    waiters[waiterID] = continuation
                     lock.unlock()
                 }
             }
         } onCancel: {
-            stop()
+            cancelWaiter(waiterID)
         }
+    }
+
+    private func cancelWaiter(_ waiterID: UUID) {
+        lock.lock()
+        let continuation = waiters.removeValue(forKey: waiterID)
+        lock.unlock()
+        continuation?.resume()
     }
 }
 

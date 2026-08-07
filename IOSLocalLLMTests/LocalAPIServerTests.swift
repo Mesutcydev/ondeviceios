@@ -702,11 +702,83 @@ final class LocalAPIServerTests: XCTestCase {
             """,
             tools: tools,
             parallelToolCalls: true,
-            parser: .qwen3XML,
+            // The registered model may still advertise Hermes; the payload's
+            // first non-whitespace character after <tool_call> is authoritative.
+            parser: .hermes,
             maximumCalls: 2
         )
         XCTAssertEqual(calls.map(\.name), ["first", "second"])
         XCTAssertEqual(calls.first?.argumentsJSON, #"{"value":1}"#)
+    }
+
+    func testToolCallingParserAcceptsXMLTagVariantsAndSchemaCoercion() throws {
+        let tool = LocalAPIToolDefinition(
+            name: "get_weather",
+            description: nil,
+            parametersJSON: #"{"properties":{"city":{"type":"string"},"count":{"type":"integer"},"enabled":{"type":"boolean"},"options":{"type":"object"},"tags":{"type":"array"},"temperature":{"type":"number"}},"required":["city"],"type":"object"}"#
+        )
+        let calls = LocalAPIToolCalling.parse(
+            """
+            <tool_call>
+              <function name="get_weather">
+                <parameter="city"> Paris </parameter>
+                <parameter name="count"> 5 </parameter>
+                <parameter=temperature> 21.5 </parameter>
+                <parameter=enabled> TRUE </parameter>
+                <parameter=options> {"unit":"C"} </parameter>
+                <parameter=tags> ["today", "tomorrow"] </parameter>
+              </function>
+              <function=get_weather>
+                <parameter=city> New York </parameter>
+              </function>
+            </tool_call>
+            """,
+            tools: [tool],
+            parallelToolCalls: true,
+            parser: .hermes,
+            maximumCalls: 2
+        )
+
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(
+            calls[0].argumentsJSON,
+            #"{"city":"Paris","count":5,"enabled":true,"options":{"unit":"C"},"tags":["today","tomorrow"],"temperature":21.5}"#
+        )
+        XCTAssertTrue(calls[1].argumentsJSON.contains(#""city":"New York""#))
+    }
+
+    func testToolCallingParserSeparatesUnavailableToolFromMalformedDialect() {
+        let tool = LocalAPIToolDefinition(
+            name: "get_weather",
+            description: nil,
+            parametersJSON: #"{"properties":{"city":{"type":"string"}},"type":"object"}"#
+        )
+        let unavailable = LocalAPIToolCalling.parseResult(
+            "<tool_call><function=delete_everything><parameter=city>x</parameter></function></tool_call>",
+            tools: [tool],
+            parallelToolCalls: false,
+            parser: .hermes
+        )
+        XCTAssertEqual(unavailable.failure, .unavailableTool("delete_everything"))
+        XCTAssertTrue(
+            LocalAPIToolCalling.toolCallErrorMessage(for: unavailable, tools: [tool])
+                .contains("unavailable tool")
+        )
+
+        let malformed = LocalAPIToolCalling.parseResult(
+            "<tool_call><function=get_weather><parameter=city> Paris",
+            tools: [tool],
+            parallelToolCalls: false,
+            parser: .hermes
+        )
+        guard case .malformed(let dialect, let rawPreview) = malformed.failure else {
+            return XCTFail("Expected malformed XML result")
+        }
+        XCTAssertEqual(dialect, "xml")
+        XCTAssertTrue(rawPreview.contains("<tool_call>"))
+        let message = LocalAPIToolCalling.toolCallErrorMessage(for: malformed, tools: [tool])
+        XCTAssertTrue(message.contains("server-side parser error"))
+        XCTAssertTrue(message.contains("<tool_call>"))
     }
 
     func testToolCallingParserRepairsTrailingCommaOnce() {
@@ -1542,6 +1614,29 @@ final class LocalAPIServerTests: XCTestCase {
         XCTAssertTrue((finishChoices.first?["delta"] as? [String: Any])?.isEmpty == true)
     }
 
+    func testOpenAIToolCallStreamingFragmentsKeepStableIndex() throws {
+        let data = LocalAPIResponse.openAIToolCallFragmentChunk(
+            id: "chatcmpl-stream",
+            model: "qwen",
+            index: 1,
+            callID: nil,
+            name: nil,
+            arguments: #"{"city":"Paris"}"#,
+            includeRole: false
+        )
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let delta = try XCTUnwrap(
+            (object["choices"] as? [[String: Any]])?.first?["delta"] as? [String: Any]
+        )
+        let calls = try XCTUnwrap(delta["tool_calls"] as? [[String: Any]])
+        XCTAssertEqual(calls.first?["index"] as? Int, 1)
+        XCTAssertNil(calls.first?["id"])
+        XCTAssertEqual(
+            (calls.first?["function"] as? [String: Any])?["arguments"] as? String,
+            #"{"city":"Paris"}"#
+        )
+    }
+
     func testAnthropicToolResponseHasCompatibilityShape() throws {
         let data = LocalAPIResponse.anthropicToolMessage(
             id: "msg_test",
@@ -1636,6 +1731,7 @@ final class LocalAPIServerTests: XCTestCase {
         XCTAssertEqual(request?.path, "/v1/chat/completions")
         XCTAssertEqual(request?.headers["authorization"], "Bearer abc")
         XCTAssertEqual(request?.body, Data("{}".utf8))
+        XCTAssertTrue(request?.wantsKeepAlive == true)
     }
 
     func testHTTPRequestAcceptsOptionalHeaderWhitespace() {
@@ -1643,6 +1739,7 @@ final class LocalAPIServerTests: XCTestCase {
         post /v1/models HTTP/1.1\r
         Authorization:\tbearer abc\r
         Content-Type:application/json\r
+        Connection: close\r
         Content-Length: 0\r
         \r
 
@@ -1651,5 +1748,6 @@ final class LocalAPIServerTests: XCTestCase {
         XCTAssertEqual(request?.path, "/v1/models")
         XCTAssertEqual(request?.headers["authorization"], "bearer abc")
         XCTAssertNil(request?.body)
+        XCTAssertFalse(request?.wantsKeepAlive == true)
     }
 }

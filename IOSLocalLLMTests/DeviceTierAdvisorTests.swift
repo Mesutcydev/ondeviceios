@@ -279,6 +279,15 @@ final class DeviceTierAdvisorTests: XCTestCase {
         let qwen = ModelCapabilityProfile.resolve(repoID: "mlx-community/Qwen3-8B-4bit")
         XCTAssertEqual(qwen.configuredContextLength, 65_536)
         XCTAssertEqual(qwen.maximumKVCacheTokens, 65_536)
+        XCTAssertGreaterThan(qwen.estimatedKVCacheBytes, 0)
+        XCTAssertGreaterThanOrEqual(
+            MemoryAdvisor.estimatedPeakFootprint(
+                weightBytes: 4_000_000_000,
+                profile: qwen
+            ),
+            4_000_000_000 + qwen.estimatedKVCacheBytes,
+            "The bounded 65K KV cache must be included in admission estimates"
+        )
         XCTAssertEqual(qwen.toolParser, .hermes)
         XCTAssertTrue(qwen.requiresYaRNContextExtension)
 

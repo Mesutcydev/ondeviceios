@@ -396,9 +396,26 @@ enum MemoryAdvisor {
         //    gate does not multiply it again.
         if let repoID = nonPresetRepoID(from: modelID),
            let onDisk = onDiskWeightsSize(forRepoID: repoID), onDisk > 0 {
-            return Int64(Double(onDisk) * workingSetOverhead)
+            return estimatedPeakFootprint(
+                weightBytes: onDisk,
+                profile: ModelCapabilityProfile.resolve(repoID: repoID)
+            )
         }
         return 0
+    }
+
+    /// Includes the fully populated, bounded KV cache in the peak estimate.
+    /// The weight-only multiplier remains the floor for models whose cache is
+    /// small; large-context profiles use the explicit cache estimate instead
+    /// of relying on a hidden generation-time allocation.
+    static func estimatedPeakFootprint(
+        weightBytes: Int64,
+        profile: ModelCapabilityProfile
+    ) -> Int64 {
+        guard weightBytes > 0 else { return 0 }
+        let weightWorkingSet = Int64(Double(weightBytes) * workingSetOverhead)
+        let cacheAwarePeak = weightBytes + max(0, profile.estimatedKVCacheBytes)
+        return max(weightWorkingSet, cacheAwarePeak)
     }
 
     /// Pulls the bare repoID out of `downloaded:…`, `imported:…`, `custom:…`.
