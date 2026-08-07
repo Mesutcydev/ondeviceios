@@ -144,6 +144,28 @@ actor MLXGenerationGate {
         await clear.value
     }
 
+    /// Run non-GPU runtime teardown after all admitted MLX work has drained,
+    /// then clear the allocator cache on a utility executor. Large
+    /// `ModelContainer` instances can synchronously release Metal-backed
+    /// storage in `deinit`; doing that from an `@MainActor` owner can freeze
+    /// the app long enough for the foreground watchdog to terminate it.
+    ///
+    /// Installing this operation as `tail` preserves the same ordering as a
+    /// normal cache clear: no later load or generation can begin until both
+    /// the owner release and allocator reclamation have finished.
+    func cleanupRuntimeWhenIdle(
+        _ cleanup: @Sendable @escaping () -> Void
+    ) async {
+        let previous = tail
+        let cleanupTask = Task.detached(priority: .utility) {
+            await previous.value
+            cleanup()
+            mlxClearCache()
+        }
+        tail = Task { await cleanupTask.value }
+        await cleanupTask.value
+    }
+
     // MARK: - Internal
 
     private func bootstrapForegroundState() async {

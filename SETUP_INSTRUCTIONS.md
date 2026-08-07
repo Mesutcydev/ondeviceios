@@ -34,8 +34,8 @@ git submodule update --init --recursive
 
 ## Build native frameworks
 
-IOSLocalLLM links locally generated llama.cpp and whisper.cpp XCFrameworks.
-The tracked root script builds the required slices from pinned submodules:
+OnDeviceLAS links the locally generated llama.cpp XCFramework. The tracked
+root script builds the native slices from pinned submodules:
 
 ```bash
 ./scripts/build_native_frameworks.sh
@@ -61,11 +61,11 @@ These outputs are generated files and must not be committed.
 ```bash
 xcodegen generate
 pod install
-open IOSLocalLLM.xcworkspace
+open OnDeviceLAS.xcworkspace
 ```
 
-Open the workspace, not the `.xcodeproj`, so the ONNX Runtime pods are
-available.
+Open the workspace, not the `.xcodeproj`, so the generated CocoaPods
+integration remains available if the target gains a native pod dependency.
 
 SwiftPM may report a conflicting `mlx-swift` identity because the project pins
 the PrismML fork for one-bit model kernels while another package declares the
@@ -75,8 +75,8 @@ a missing package in the current lockfile.
 
 ## Run in Simulator
 
-Select the `IOSLocalLLM` scheme and an iOS 18 or newer Simulator. Simulator builds
-do not require a paid Apple Developer Program membership.
+Select the `OnDeviceLAS` scheme and an iOS 18 or newer Simulator. Simulator
+builds do not require a paid Apple Developer Program membership.
 
 The source-only build starts without bundled AI weights. Features that depend
 on a model become available after the user downloads a compatible model from
@@ -86,11 +86,10 @@ the app's model catalog.
 
 Use your own signing identity:
 
-1. Select the IOSLocalLLM project in Xcode.
-2. For the app, share extension, unit-test, and UI-test targets, select your
-   development team.
-3. Replace the app, extension, App Group, and CloudKit identifiers with values
-   owned by your team, following [Docs/FORK_CONFIGURATION.md](Docs/FORK_CONFIGURATION.md).
+1. Select the OnDeviceLAS project in Xcode.
+2. For the app and unit-test targets, select your development team.
+3. Replace the app and test bundle identifiers with values owned by your team,
+   following [Docs/FORK_CONFIGURATION.md](Docs/FORK_CONFIGURATION.md).
 4. Build and run on your device.
 
 If you regenerate the project, make permanent identifier changes in
@@ -137,8 +136,8 @@ Run app unit tests from Xcode or with a Simulator destination:
 
 ```bash
 xcodebuild test \
-  -workspace IOSLocalLLM.xcworkspace \
-  -scheme IOSLocalLLM \
+  -workspace OnDeviceLAS.xcworkspace \
+  -scheme OnDeviceLAS \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```
 

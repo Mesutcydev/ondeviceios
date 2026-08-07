@@ -18,8 +18,8 @@ Automated, repeatable checks currently include:
 | Repository hygiene | `./scripts/validate_open_source.sh` | Linux or macOS |
 | VoiceAgentOrb package | `swift test --package-path Packages/VoiceAgentOrb` | macOS CI |
 | XcodeGen consistency | `xcodegen generate` followed by a clean diff | macOS |
-| App workspace build | `xcodebuild build -workspace IOSLocalLLM.xcworkspace -scheme IOSLocalLLM -destination 'platform=iOS Simulator,name=iPhone 17'` | iPhone 17 simulator, iOS 27 |
-| App unit and UI tests | `xcodebuild test -workspace IOSLocalLLM.xcworkspace -scheme IOSLocalLLM -destination 'platform=iOS Simulator,name=iPhone 17'` | iPhone 17 simulator, iOS 27 |
+| App workspace build | `xcodebuild build -workspace OnDeviceLAS.xcworkspace -scheme OnDeviceLAS -destination 'platform=iOS Simulator,name=iPhone 17'` | iPhone 17 simulator, iOS 27 |
+| App unit tests | `xcodebuild test -workspace OnDeviceLAS.xcworkspace -scheme OnDeviceLAS -destination 'platform=iOS Simulator,name=iPhone 17'` | iPhone 17 simulator, iOS 27 |
 
 On 29 July 2026, the open-source workspace built successfully and the
 first-launch legal flow, onboarding, Home, Assistant, and Models screens were

@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>iOS Local LLM</string>
+	<string>On Device: LAS</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -18,35 +18,14 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>3.2.6</string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleURLName</key>
-			<string>com.mesutcydev.ioslocalllm.scheme</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>ios-local-llm</string>
-			</array>
-		</dict>
-	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
-	<key>NSCameraUsageDescription</key>
-	<string>iOS Local LLM uses the back camera to capture live video of your terminal or code editor for real-time analysis.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>iOS Local LLM can expose your on-device language model to computers on your local network when you enable the Local API Server.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>iOS Local LLM uses the microphone for hold-to-talk dictation in the chat composer. Audio is transcribed on-device and never leaves your phone.</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>iOS Local LLM can analyze code from photos in your library.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>iOS Local LLM uses on-device speech recognition to convert your voice into text for the chat composer.</string>
-	<key>NSSupportsLiveActivities</key>
-	<true/>
+	<string>On Device: LAS exposes your selected on-device language model to trusted computers on your local network.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

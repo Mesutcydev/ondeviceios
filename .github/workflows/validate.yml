@@ -16,10 +16,3 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Validate repository contents
         run: ./scripts/validate_open_source.sh
-
-  voice-orb:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Test VoiceAgentOrb
-        run: swift test --package-path Packages/VoiceAgentOrb

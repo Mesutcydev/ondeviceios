@@ -185,11 +185,11 @@ actor BridgeServer {
 
     private func handleInfer(_ req: HTTPRequest, conn: NWConnection) async {
         guard bearerValid(req) else { await respond(conn, status: 401, body: "Unauthorized"); return }
-        guard let lease = await RemoteInferenceGate.shared.acquire() else {
+        guard let lease = RemoteInferenceGate.shared.acquire() else {
             await respond(conn, status: 503, body: "Model busy")
             return
         }
-        defer { Task { await RemoteInferenceGate.shared.release(lease) } }
+        defer { RemoteInferenceGate.shared.release(lease) }
 
         guard let body = req.body,
               let ir = try? JSONDecoder().decode(InferenceRequestDTO.self, from: body) else {
@@ -236,7 +236,11 @@ actor BridgeServer {
             // the stream (consumer stops iterating, or finish() on natural
             // completion) now cancels the underlying generation so the model
             // stops immediately and isGenerating is released promptly.
-            continuation.onTermination = { _ in
+            continuation.onTermination = { termination in
+                // Natural completion is not cancellation. An unconditional
+                // stop here can race the next request and cancel its model
+                // generation when the previous stream is being torn down.
+                guard case .cancelled = termination else { return }
                 Task { @MainActor in
                     CodingAssistantService.shared.stopGeneration()
                 }

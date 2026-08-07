@@ -1,6 +1,6 @@
-name: IOSLocalLLM
+name: OnDeviceLAS
 options:
-  bundleIdPrefix: com.mesutcydev.ioslocalllm
+  bundleIdPrefix: com.mesutcydev.ondevicelas
   deploymentTarget:
     iOS: "18.0"
   xcodeVersion: "26.0"
@@ -8,9 +8,6 @@ options:
   groupSortPosition: top
 
 packages:
-  # Local premium glass voice orb (Canvas). Theme selector case: `.glass`.
-  VoiceAgentOrb:
-    path: Packages/VoiceAgentOrb
   # MLX runtime stack. The app's source targets the mlx-swift-lm 3.x API
   # (actor type/processor registries, config creators receive Data not URL,
   # loadContainer(from:configuration:)) and imports MLXLMTransformers — the
@@ -36,6 +33,14 @@ packages:
   swift-transformers-mlx:
     url: https://github.com/DePasqualeOrg/swift-transformers-mlx
     from: "0.2.0"
+  coreai-models:
+    # Local pin with OnDeviceLAS patch: removes FoundationModels
+    # `.updateUsage` so the Core AI app launches on iOS 27 betas whose
+    # FoundationModels binary does not export that symbol yet.
+    path: Packages/coreai-models
+  # Upstream (re-enable when OS/SDK symbols match):
+  # url: https://github.com/apple/coreai-models.git
+  # revision: 938d0b8943b942ce66438b94ab017c5631d1aef4
 
 settings:
   base:
@@ -53,33 +58,13 @@ settings:
     CLANG_ANALYZER_SECURITY_INSECUREAPI_RAND: YES
     CLANG_ANALYZER_SECURITY_INSECUREAPI_STRCPY: YES
     SWIFT_OPTIMIZATION_LEVEL: "-Onone"
-    # The bundled llama/whisper Catalyst frameworks are Apple-Silicon-only.
-    "EXCLUDED_ARCHS[sdk=macosx*]": "x86_64"
-    # Keep Catalyst linking on Xcode's Swift toolchain. Xcode 26.5 otherwise
-    # substitutes the separate Metal toolchain and adds a nonexistent
-    # usr/lib/swift/maccatalyst search path.
-    "TOOLCHAIN_DIR[sdk=macosx*]": "$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain"
-    # Xcode 26.5 otherwise expands the Catalyst Swift search path against
-    # the selected Metal toolchain, whose maccatalyst directory does not exist.
-    "LIBRARY_SEARCH_PATHS[sdk=macosx*]":
-      - "$(BUILT_PRODUCTS_DIR)"
-      - "$(SDKROOT)/System/iOSSupport/usr/lib"
-      - "$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/maccatalyst"
-    # The postCompileScripts below (Copy bundled VLM, Compile FastVLM)
-    # rsync/coremlcompiler into TARGET_BUILD_DIR. Their outputs aren't
-    # declarable statically (rsync mirrors a directory tree of varying
-    # contents), so user script sandboxing — which only permits writes
-    # to declared output paths — rejects them with mkdir deny errors.
-    # Disabling sandboxing per-build-script in xcodegen isn't supported,
-    # so disable it project-wide.
-    ENABLE_USER_SCRIPT_SANDBOXING: NO
   configs:
     Release:
       SWIFT_OPTIMIZATION_LEVEL: "-O"
       VALIDATE_PRODUCT: YES
 
 targets:
-  IOSLocalLLM:
+  OnDeviceLAS:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
@@ -88,7 +73,7 @@ targets:
         excludes:
           - "**/*.mlmodelc"
           - "**/FastVLM-0.5B-fp16/**"
-          - "**/yolo11n.mlpackage"     # Removed — AGPL-3.0, replaced by Apple Vision
+          - "**/yolo11n.mlpackage"
           - "**/*.png"
           - "**/*.PNG"
           - "**/*.jpg"
@@ -96,49 +81,64 @@ targets:
           - "**/*.jpeg"
           - "**/*.JPEG"
           - "**/*.md"
-          # LocalCoderBridge Mac installer — the app downloads this from
-          # mesut.uk at runtime (see BridgePairingView), it must NOT ship
-          # inside the iOS bundle (dead weight + odd for App Review).
+          # Model metadata and weights may exist locally for development, but
+          # they must never be discovered as bundle resources by XcodeGen.
+          - "**/*.json"
+          - "**/*.txt"
+          - "**/*.bin"
+          - "**/*.gguf"
+          - "**/*.safetensors"
+          - "**/*.mlpackage"
+          - "**/*.onnx"
+          - "**/*.npz"
+          # Mac installer assets are never part of the server-only bundle.
           - "**/*.pkg"
-          # SmolVLM GGUF weights ship as a folder reference under the
-          # postCompileScript below — exclude from the implicit source
-          # scan so Xcode doesn't try to compile the .gguf files as
-          # Swift inputs. Same pattern as the old MLX SmolVLM bundle
-          # this replaced; see BundledVLMInstaller for the rationale.
           - "Resources/BundledVLM/**"
-          # KittenTTS + Kokoro CoreML voice models. Same rationale as
-          # BundledVLM: they're shipped via a postCompileScript rsync
-          # below so Voice mode works offline with zero downloads. The
-          # source scan would otherwise try to swift-compile every
-          # .mil / .bin / weight blob and fail.
           - "Resources/BundledVoiceModels/**"
+          # This product has one screen: the authenticated local API server.
+          # Keep the inference and safety services above it, but do not compile
+          # the assistant, lens, voice, settings, or bridge UI surfaces.
+          - "**/Views/**"
+          - "**/ViewModels/**"
+          - "**/TipsManager.swift"
+          - "**/Services/Intents/**"
+          # This product exposes the local OpenAI/Anthropic/Ollama listener
+          # only. The paired-Mac bridge, QR/TLS pairing, silent-push wakeup,
+          # and app-tab handoff runtime are deliberately not compiled into
+          # the server-only target.
+          - "Models/AppBridge.swift"
+          - "Services/LifecycleController.swift"
+          - "Services/WipeAllDataService.swift"
+          - "Services/Bridge/Agent/**"
+          - "Services/Bridge/BonjourPublisher.swift"
+          - "Services/Bridge/BridgeIdentity.swift"
+          - "Services/Bridge/BridgeManager.swift"
+          - "Services/Bridge/BridgePairingStore.swift"
+          - "Services/Bridge/BridgeServer.swift"
+          - "Services/Bridge/BridgeWakeup.swift"
+          - "Services/Bridge/DEREncoder.swift"
+          # The server target has no speech, TTS, or voice-conversation path.
+          - "**/Services/Voice/**"
+          - "**/VoiceConversationService.swift"
+          - "**/SpeechDictationService.swift"
+          - "**/AudioTranscriptionService.swift"
+          - "**/VoiceCatalogStore.swift"
+          - "**/VoiceProfile.swift"
+          - "**/VoiceSettingsStore.swift"
+          - "**/Resources/VoiceModelCatalog.json"
+          - "**/Resources/Voice/**"
+      # The server homepage uses this one reusable SwiftUI status component;
+      # the remainder of the legacy Views directory stays excluded above.
+      - path: IOSLocalLLM/Views/LiveParserBar.swift
+      # Transparent Liquid Glass primitives (CodeLens-parity optical layer).
+      - path: IOSLocalLLM/Views/GlassEffects.swift
+      - path: IOSLocalLLM/Views/LiquidPinkBackdrop.swift
     resources:
-      # Model-specific tokenizers and processor files are intentionally not
-      # redistributed. The downloaded model must provide its own metadata.
       - path: IOSLocalLLM/PrivacyInfo.xcprivacy
-      - path: IOSLocalLLM/Resources/Localization/WebTriggerKeywords.json
-      # CMU Pronouncing Dictionary — trimmed (primary pronunciations only,
-      # 126K entries, 3.2 MB plain text). Used by PhonemizerEN to convert
-      # English text to IPA phonemes for the neural TTS engines (Kokoro,
-      # KittenTTS). Without a real dictionary the home-grown
-      # letter-to-sound rules in the old BasicG2P produced phonemes
-      # that were so far off-distribution the models output a robotic,
-      # zombie-like voice. Source: cmusphinx/cmudict on GitHub,
-      # permissive CMUdict license; see IOSLocalLLM/Resources/Voice/LICENSE.
-      - path: IOSLocalLLM/Resources/Voice/cmudict.txt
-      - path: IOSLocalLLM/Resources/VoiceModelCatalog.json
-      # NOTE: SmolVLM2-500M weights (~1 GB) are *not* listed here. They
-      # are copied into the .app by a postBuildScript below (see
-      # "Copy SmolVLM bundled weights"). xcodegen 2.45 applies the
-      # target's `sources.excludes` patterns to `resources` paths too —
-      # so excluding the directory from the source scan (we have to,
-      # otherwise the safetensors gets indexed as a Swift source) also
-      # silently drops any resources entry pointing into it. A
-      # postBuildScript sidesteps that bug.
     info:
       path: IOSLocalLLM/Info.plist
       properties:
-        CFBundleDisplayName: iOS Local LLM
+        CFBundleDisplayName: "On Device: LAS"
         # Source of truth for both targets' marketing version. xcodegen
         # writes these into the generated Info.plist files on every run,
         # so hand-edits to those plists get reverted next regen — always
@@ -148,11 +148,7 @@ targets:
         # Standard HTTPS only — answers the ASC export-compliance question
         # automatically so review submission doesn't stall on it.
         ITSAppUsesNonExemptEncryption: false
-        NSCameraUsageDescription: "iOS Local LLM uses the back camera to capture live video of your terminal or code editor for real-time analysis."
-        NSPhotoLibraryUsageDescription: "iOS Local LLM can analyze code from photos in your library."
-        NSMicrophoneUsageDescription: "iOS Local LLM uses the microphone for hold-to-talk dictation in the chat composer. Audio is transcribed on-device and never leaves your phone."
-        NSLocalNetworkUsageDescription: "iOS Local LLM can expose your on-device language model to computers on your local network when you enable the Local API Server."
-        NSSpeechRecognitionUsageDescription: "iOS Local LLM uses on-device speech recognition to convert your voice into text for the chat composer."
+        NSLocalNetworkUsageDescription: "On Device: LAS exposes your selected on-device language model to trusted computers on your local network."
         UIRequiresFullScreen: true
         UIStatusBarStyle: UIStatusBarStyleDarkContent
         UIViewControllerBasedStatusBarAppearance: false
@@ -162,60 +158,25 @@ targets:
           UIColorName: ""
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
-        NSSupportsLiveActivities: true
-        # Make downloaded/imported models under Documents/HFModels visible at
-        # Files → On My iPhone → iOS Local LLM. Per-model export remains
-        # available from the Models tab for copying to any Files provider.
+        # Make downloaded/imported models visible in Files for the server
+        # operator. The API itself remains the only in-app feature.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        CFBundleURLTypes:
-          - CFBundleURLName: com.mesutcydev.ioslocalllm.scheme
-            CFBundleURLSchemes:
-              - ios-local-llm
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ioslocalllm.IOSLocalLLM
+        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ondevicelas
         INFOPLIST_FILE: IOSLocalLLM/Info.plist
         CODE_SIGN_ENTITLEMENTS: IOSLocalLLM/IOSLocalLLM.entitlements
         CODE_SIGN_STYLE: Automatic
         VERSIONING_SYSTEM: apple-generic
-        CURRENT_PROJECT_VERSION: "99"
-        # PCC symbols exist only in the iOS 27 SDK. Enable the implementation
-        # and its capability automatically for iOS 27 device/simulator builds;
-        # Xcode 26 and iOS 18–26 builds keep the existing local-only binary.
-        "SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos27.*]": "$(inherited) FM_PCC"
-        "SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphonesimulator27.*]": "$(inherited) FM_PCC"
-        "CODE_SIGN_ENTITLEMENTS[sdk=iphoneos27.*]": IOSLocalLLM/IOSLocalLLM-PCC.entitlements
-        # iOS stays iPhone-only (family 1) so the iPhone app is unchanged.
-        # Mac Catalyst is built against the macosx SDK and *requires* the
-        # iPad idiom (family 2) plus Mac (6); scope that to the macOS SDK
-        # only via a conditional setting so it never affects the iOS build.
+        CURRENT_PROJECT_VERSION: "139"
+        # iPhone-only server surface.
         TARGETED_DEVICE_FAMILY: "1"
-        "TARGETED_DEVICE_FAMILY[sdk=macosx*]": "2,6"
-        # ── Mac Catalyst ────────────────────────────────────────
-        # Adds a native Mac (Catalyst) build of this same target. The
-        # llama.cpp + whisper.cpp xcframeworks ship an `ios-arm64-maccatalyst`
-        # slice (built via scripts/build_native_frameworks.sh --with-catalyst).
-        # Apple-Silicon only — no x86_64 Catalyst slice exists.
-        SUPPORTS_MACCATALYST: YES
-        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
-        # Keep the SAME bundle id on Mac so it's the same product, not a
-        # separate derived identifier.
-        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
-        # Catalyst maps the iOS 18 deployment target to a high macOS
-        # minimum; pin the Catalyst macOS floor explicitly instead.
-        MACOSX_DEPLOYMENT_TARGET: "13.0"
-        # Use a Catalyst-specific entitlements set (App Sandbox + camera/
-        # mic/network) on the macOS SDK; the iOS entitlements are untouched.
-        "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": IOSLocalLLM/IOSLocalLLM-Catalyst.entitlements
+        SUPPORTS_MACCATALYST: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # Default icon is the neon pink "eye" mark (AppIcon); the previous
-        # pink mark ships as AppIconClassic so users can switch back in
-        # Settings → Appearance. INCLUDE_ALL_APPICON_ASSETS is required for
-        # alternate icons to be compiled into the bundle.
         ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: YES
         SWIFT_EMIT_LOC_STRINGS: YES
-        # IOSLocalLLMTests uses `@testable import IOSLocalLLM`, and the scheme
+        # OnDeviceLASTests uses `@testable import OnDeviceLAS`, and the scheme
         # builds the tests for both Debug and Release configs. Without
         # ENABLE_TESTABILITY on Release, the test module dependency
         # can't resolve and `xcodebuild -configuration Release build`
@@ -233,13 +194,7 @@ targets:
           - "$(SRCROOT)/ThirdParty/llama.cpp/tools/mtmd"
           - "$(SRCROOT)/ThirdParty/llama.cpp/include"
           - "$(SRCROOT)/ThirdParty/llama.cpp/ggml/include"
-          # whisper.h lives inside the framework, but adding the source
-          # include dir makes the bridging header importable without
-          # full module-map gymnastics.
-          - "$(SRCROOT)/ThirdParty/whisper.cpp/include"
     dependencies:
-      - package: VoiceAgentOrb
-        product: VoiceAgentOrb
       - package: mlx-swift-lm
         product: MLXLLM
       - package: mlx-swift-lm
@@ -269,161 +224,21 @@ targets:
       # libllama + libggml with Metal backend.
       - framework: ThirdParty/llama.cpp/build-apple/llama.xcframework
         embed: true
-      # whisper.cpp prebuilt xcframework — built by
-      # scripts/build_native_frameworks.sh. Provides libwhisper with the Metal backend
-      # for on-device speech-to-text without SFSpeechRecognizer's
-      # cloud-fallback dependency.
-      - framework: ThirdParty/whisper.cpp/build-apple/whisper.xcframework
-        embed: true
-      - target: IOSLocalLLMShareExtension
-        embed: true
-        # The share extension is an iOS-only app-extension; a Mac Catalyst app
-        # may not embed an iOS .appex. `platformFilter: iOS` emits the PBX
-        # `ios` build-file filter so the extension is embedded for iOS only and
-        # skipped on the Mac build. (Mac has its own system share mechanisms.)
-        platformFilter: iOS
-    # Copy the pre-bundled SmolVLM2-500M weights into the .app before
-    # codesigning runs. We can't use the regular `resources:` entry
-    # because xcodegen 2.45 propagates `sources.excludes` patterns to
-    # resources paths, and we need to exclude the weights folder from
-    # the source scan (else Xcode treats the safetensors as a source
-    # input). postCompileScripts runs after the Sources phase but
-    # before Copy Resources / codesign, so the weights end up signed
-    # like any other bundled asset.
-    postCompileScripts:
-      - name: Copy bundled VLM (SmolVLM2 GGUF)
-        script: |
-          set -e
-          SRC="${SRCROOT}/IOSLocalLLM/Resources/BundledVLM"
-          DEST="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BundledVLM"
-          if [ ! -d "$SRC" ]; then
-            echo "warning: BundledVLM source not found at $SRC — skipping (lens tab will fall back to network download of SmolVLM2 GGUF, ~520 MB on first launch)"
-            exit 0
-          fi
-          mkdir -p "$DEST"
-          # rsync with --delete keeps the bundled copy in sync if files
-          # are added/removed in source between builds. -a preserves
-          # times so incremental builds skip unchanged files. The
-          # bundle folder contains the GGUF pair:
-          #   ggml-org_SmolVLM2-500M-Video-Instruct-GGUF/
-          #     SmolVLM2-500M-Video-Instruct-Q8_0.gguf       (~417 MB)
-          #     mmproj-SmolVLM2-500M-Video-Instruct-Q8_0.gguf (~104 MB)
-          rsync -a --delete "$SRC/" "$DEST/"
-          echo "Copied bundled VLM (SmolVLM2 GGUF Q8) to $DEST"
-        runOnlyWhenInstalling: false
-        basedOnDependencyAnalysis: false
-
-      - name: Copy bundled voice models (Silero VAD)
-        script: |
-          set -e
-          SRC="${SRCROOT}/IOSLocalLLM/Resources/BundledVoiceModels"
-          DEST="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BundledVoiceModels"
-          if [ ! -d "$SRC" ]; then
-            echo "warning: BundledVoiceModels source not found at $SRC — Voice mode will require a runtime download from Models → Catalog."
-            exit 0
-          fi
-          mkdir -p "$DEST"
-          # Only Silero (the ~0.9 MB listening VAD) ships in the app now.
-          # KittenTTS (~62 MB) and Kokoro (~312 MB) were UNBUNDLED to shrink
-          # the IPA — they download on demand via ModelDownloadCenter when the
-          # user picks a neural voice. Apple System Voice remains the
-          # zero-download default, so voice works out of the box without them.
-          # Remove any stale copies a previous (fully-bundled) build left in
-          # DEST so incremental archives don't keep shipping them.
-          rm -rf "$DEST/KittenTTS" "$DEST/Kokoro"
-          rsync -a --delete "$SRC/Silero/" "$DEST/Silero/"
-          echo "Copied bundled Silero VAD to $DEST/Silero"
-        runOnlyWhenInstalling: false
-        basedOnDependencyAnalysis: false
-
-      - name: Compile and bundle FastVLM Core ML encoder
-        script: |
-          set -e
-          SRC="${SRCROOT}/IOSLocalLLM/Models/FastVLM-0.5B-fp16/fastvithd.mlpackage"
-          DEST_DIR="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
-          DEST_PACKAGE="${DEST_DIR}/fastvithd.mlpackage"
-          DEST_COMPILED="${DEST_DIR}/fastvithd.mlmodelc"
-          if [ ! -d "$SRC" ]; then
-            echo "warning: fastvithd.mlpackage not found at $SRC — FastVLM lens path will be unavailable on this build."
-            exit 0
-          fi
-          # Prefer shipping the pre-compiled .mlmodelc so the first
-          # camera tap doesn't pay the ~2-3 s on-device compile cost.
-          # coremlcompiler is the Xcode-bundled tool that runs the
-          # same compile step Xcode's build system uses for sources.
-          COREMLC="$(xcrun --find coremlcompiler 2>/dev/null || true)"
-          if [ -n "$COREMLC" ] && [ -x "$COREMLC" ]; then
-            rm -rf "$DEST_COMPILED"
-            "$COREMLC" compile "$SRC" "$DEST_DIR" >/dev/null
-            # coremlcompiler writes <name>.mlmodelc into the dest dir,
-            # so DEST_COMPILED is now populated. Drop the raw
-            # mlpackage so we don't ship both.
-            rm -rf "$DEST_PACKAGE"
-            echo "Compiled FastVLM encoder to $DEST_COMPILED"
-          else
-            # Fallback: ship the raw mlpackage. FastVLMCoreMLStub
-            # handles runtime compilation via MLModel.compileModel,
-            # which costs a few seconds on first launch but is
-            # functionally equivalent.
-            rsync -a --delete "$SRC/" "$DEST_PACKAGE/"
-            echo "Copied raw FastVLM encoder mlpackage to $DEST_PACKAGE (no coremlcompiler available — will compile at runtime)"
-          fi
-        runOnlyWhenInstalling: false
-        basedOnDependencyAnalysis: false
-
-  IOSLocalLLMShareExtension:
-    type: app-extension
-    platform: iOS
-    deploymentTarget: "18.0"
-    sources:
-      - path: IOSLocalLLMShareExtension
-        excludes:
-          - "Info.plist"
-          - "*.entitlements"
-    info:
-      path: IOSLocalLLMShareExtension/Info.plist
-      properties:
-        CFBundleDisplayName: iOS Local LLM
-        # Must match the main target's version above — App Store rejects
-        # extension targets with mismatched marketing versions.
-        CFBundleShortVersionString: "3.2.6"
-        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        ITSAppUsesNonExemptEncryption: false
-        NSExtension:
-          NSExtensionAttributes:
-            NSExtensionActivationRule:
-              NSExtensionActivationSupportsImageWithMaxCount: 1
-              NSExtensionActivationSupportsText: true
-              NSExtensionActivationSupportsWebURLWithMaxCount: 1
-              NSExtensionActivationSupportsWebPageWithMaxCount: 1
-          NSExtensionPointIdentifier: com.apple.share-services
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ioslocalllm.IOSLocalLLM.share
-        INFOPLIST_FILE: IOSLocalLLMShareExtension/Info.plist
-        CODE_SIGN_ENTITLEMENTS: IOSLocalLLMShareExtension/IOSLocalLLMShareExtension.entitlements
-        CODE_SIGN_STYLE: Automatic
-        VERSIONING_SYSTEM: apple-generic
-        CURRENT_PROJECT_VERSION: "99"
-        TARGETED_DEVICE_FAMILY: "1"
-        SWIFT_EMIT_LOC_STRINGS: YES
-
-  IOSLocalLLMTests:
+  OnDeviceLASTests:
     type: bundle.unit-test
     platform: iOS
     deploymentTarget: "18.0"
     sources:
-      - path: IOSLocalLLMTests
+      - path: IOSLocalLLMTests/LocalAPIServerTests.swift
+      - path: IOSLocalLLMTests/DeviceTierAdvisorTests.swift
     dependencies:
-      - target: IOSLocalLLM
+      - target: OnDeviceLAS
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ioslocalllm.IOSLocalLLMTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ondevicelas.tests
         INFOPLIST_FILE: ""   # auto-generate
         CODE_SIGN_STYLE: Automatic
         TARGETED_DEVICE_FAMILY: "1"
-        "TARGETED_DEVICE_FAMILY[sdk=macosx*]": "2,6"
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_EMIT_LOC_STRINGS: NO
         # Clear the bridging header — tests only test Swift code.
@@ -438,33 +253,136 @@ targets:
           - "$(SRCROOT)/ThirdParty/llama.cpp/ggml/include"
           - "$(SRCROOT)/ThirdParty/whisper.cpp/include"
 
-  IOSLocalLLMUITests:
-    type: bundle.ui-testing
+  # Independent iOS 27/Core AI server product. This deliberately owns a
+  # separate bundle and settings namespace while reusing the reference
+  # dashboard/API source tree. CORE_AI_SERVER_APP switches only the inference
+  # boundary; the existing OnDeviceLAS target remains unchanged.
+  CoreAIOnDeviceLAS:
+    type: application
     platform: iOS
-    deploymentTarget: "18.0"
+    deploymentTarget: "27.0"
     sources:
-      - path: IOSLocalLLMUITests
-    dependencies:
-      - target: IOSLocalLLM
+      # Explicit source ownership is intentional. The Core AI target does
+      # not compile the reference app's MLX, llama.cpp, voice, camera, lens,
+      # speech, or Mac-bridge implementation files.
+      - path: CoreAIOnDeviceLAS
+        excludes:
+          - "**/*.plist"
+          - "**/*.xcprivacy"
+          - "**/*.entitlements"
+      - path: IOSLocalLLM/Models/ChatMessage.swift
+      - path: IOSLocalLLM/Models/TokenLogprob.swift
+      - path: IOSLocalLLM/Services/Bridge/LocalAPIServer.swift
+      - path: IOSLocalLLM/Services/Bridge/RemoteInferenceGate.swift
+      - path: IOSLocalLLM/Services/CoreAIModelStore.swift
+      - path: IOSLocalLLM/Services/CoreAILanguageModelService.swift
+      - path: IOSLocalLLM/Services/CoreAIVisionService.swift
+      - path: IOSLocalLLM/Services/RuntimeLogCenter.swift
+      - path: IOSLocalLLM/Services/Web/KeychainStore.swift
+      - path: IOSLocalLLM/Services/HFTokenStore.swift
+      - path: IOSLocalLLM/Services/HFSearchService.swift
+      - path: IOSLocalLLM/Services/BackgroundDownloadCoordinator.swift
+      - path: IOSLocalLLM/HFTokenSettingsView.swift
+      - path: IOSLocalLLM/Views/CoreAIModelManagementView.swift
+      - path: IOSLocalLLM/Services/LocalModelDocumentPickerSession.swift
+      - path: IOSLocalLLM/Views/LocalModelDocumentsImportSheet.swift
+      - path: IOSLocalLLM/Views/GlassEffects.swift
+      - path: IOSLocalLLM/Views/LiquidPinkBackdrop.swift
+      - path: IOSLocalLLM/Models/KoduTheme.swift
+      - path: IOSLocalLLM/LASDesignSystem.swift
+      - path: IOSLocalLLM/LASTheme.swift
+      - path: IOSLocalLLM/Views/LiveParserBar.swift
+      - path: IOSLocalLLM/Services/ToastCenter.swift
+      - path: IOSLocalLLM/RuntimeTerminalView.swift
+      # On-device debugger (crash breadcrumbs, load telemetry, admission
+      # snapshot, live events, export). The diagnostics stack and debugger
+      # view are shared with OnDeviceLAS; the CoreAI editions of the memory
+      # and safety services live in CoreAIOnDeviceLAS/CoreAIDebuggerServices.
+      - path: IOSLocalLLM/OnDeviceDebuggerView.swift
+      - path: IOSLocalLLM/Services/Diagnostics/Diagnostics.swift
+      - path: IOSLocalLLM/Services/Diagnostics/CrashReporter.swift
+      - path: IOSLocalLLM/Services/Diagnostics/SystemSnapshot.swift
+      - path: IOSLocalLLM/Models/Int64+FormattedBytes.swift
+    resources:
+      - path: CoreAIOnDeviceLAS/PrivacyInfo.xcprivacy
+      - path: CoreAIOnDeviceLAS/Assets.xcassets
+    info:
+      path: CoreAIOnDeviceLAS/Info.plist
+      properties:
+        CFBundleDisplayName: "Core AI: LAS"
+        CFBundleShortVersionString: "3.2.6"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        ITSAppUsesNonExemptEncryption: false
+        NSLocalNetworkUsageDescription: "Core AI: LAS exposes your selected on-device Core AI model to trusted computers on your local network."
+        UIRequiresFullScreen: true
+        UIStatusBarStyle: UIStatusBarStyleDarkContent
+        UIViewControllerBasedStatusBarAppearance: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ioslocalllm.IOSLocalLLMUITests
+        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.coreaiondevicelas
+        INFOPLIST_FILE: CoreAIOnDeviceLAS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: CoreAIOnDeviceLAS/CoreAIOnDeviceLAS.entitlements
+        CODE_SIGN_STYLE: Automatic
+        VERSIONING_SYSTEM: apple-generic
+        CURRENT_PROJECT_VERSION: "138"
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+        ENABLE_TESTABILITY: YES
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) CORE_AI_SERVER_APP"
+    dependencies:
+      - package: coreai-models
+        product: CoreAILM
+      - package: coreai-models
+        product: CoreAISegmentation
+
+  CoreAIOnDeviceLASTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: IOSLocalLLMTests/CoreAIModelStoreTests.swift
+    dependencies:
+      - target: CoreAIOnDeviceLAS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.coreaiondevicelas.tests
+        GENERATE_INFOPLIST_FILE: YES
         CODE_SIGN_STYLE: Automatic
         TARGETED_DEVICE_FAMILY: "1"
-        GENERATE_INFOPLIST_FILE: YES
         SWIFT_EMIT_LOC_STRINGS: NO
+        SWIFT_OBJC_BRIDGING_HEADER: ""
 
 schemes:
-  IOSLocalLLM:
+  OnDeviceLAS:
     build:
       targets:
-        IOSLocalLLM: all
-        IOSLocalLLMTests: [test, run]
-        IOSLocalLLMUITests: [test]
+        OnDeviceLAS: all
+        OnDeviceLASTests: [test, run]
     test:
       config: Debug
       targets:
-        - IOSLocalLLMTests
-        - IOSLocalLLMUITests
+        - OnDeviceLASTests
+    archive:
+      config: Release
+
+  CoreAIOnDeviceLAS:
+    build:
+      targets:
+        CoreAIOnDeviceLAS: all
+    test:
+      config: Debug
+      targets:
+        - CoreAIOnDeviceLASTests
     archive:
       config: Release

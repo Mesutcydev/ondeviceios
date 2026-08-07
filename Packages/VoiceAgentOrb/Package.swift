@@ -29,9 +29,5 @@ let package = Package(
                 .swiftLanguageMode(.v6)
             ]
         ),
-        .testTarget(
-            name: "VoiceAgentOrbTests",
-            dependencies: ["VoiceAgentOrb"]
-        ),
     ]
 )

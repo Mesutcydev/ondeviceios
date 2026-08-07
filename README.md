@@ -5,6 +5,7 @@ authenticated local API. Built in SwiftUI with MLX, llama.cpp, whisper.cpp, and
 Core ML. No account. No telemetry. No cloud inference by default.
 
 [![Validate](https://github.com/Mesutcydev/ios-local-llm/actions/workflows/validate.yml/badge.svg)](https://github.com/Mesutcydev/ios-local-llm/actions/workflows/validate.yml)
+[![CodeQL](https://github.com/Mesutcydev/ios-local-llm/actions/workflows/codeql.yml/badge.svg)](https://github.com/Mesutcydev/ios-local-llm/actions/workflows/codeql.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Mesutcydev/ios-local-llm/badge)](https://scorecard.dev/viewer/?uri=github.com/Mesutcydev/ios-local-llm)
 [![License: MIT](https://img.shields.io/badge/original%20code-MIT-2ea44f.svg)](LICENSE)
 [![Swift](https://img.shields.io/badge/Swift-5.10-F05138.svg)](https://www.swift.org/)
@@ -28,6 +29,12 @@ agent channel.
 
 Repository slug remains `ios-local-llm` for stable links. Product name is
 **OnDevice Local AI Studio**. Site: [mesut.uk/apps/codelens](https://mesut.uk/apps/codelens).
+
+The generated `OnDeviceLAS` target is the current server-only distribution of
+this source tree. It keeps local model loading, safety policy, and the
+authenticated API surface while omitting the assistant, lens, voice, and
+paired-Mac UI from the shipped app. The broader source catalog remains
+available for reuse and reference.
 
 The app was previously distributed through the App Store. This repository is
 now the canonical source distribution. Sideload builds may appear under
@@ -159,10 +166,10 @@ Generate the Xcode project and install CocoaPods:
 ```bash
 xcodegen generate
 pod install
-open IOSLocalLLM.xcworkspace
+open OnDeviceLAS.xcworkspace
 ```
 
-Select the `IOSLocalLLM` scheme and an iOS Simulator. For a physical device,
+Select the `OnDeviceLAS` scheme and an iOS Simulator. For a physical device,
 change the bundle identifiers and select your own development team in Xcode.
 See [SETUP_INSTRUCTIONS.md](SETUP_INSTRUCTIONS.md) and
 [fork configuration](Docs/FORK_CONFIGURATION.md) for every identifier,

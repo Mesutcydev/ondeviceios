@@ -44,17 +44,4 @@
 // decode in one call.
 #import "mtmd-helper.h"
 
-// whisper.cpp — on-device speech-to-text. Built via
-// ThirdParty/whisper.cpp/build-xcframework.sh (iOS slices only). The
-// header is the same one shipped in the framework's Headers/ folder;
-// we point at the source-tree copy via HEADER_SEARCH_PATHS so the
-// bridging compile doesn't need to know the framework's umbrella
-// layout. Key symbols: whisper_init_from_file_with_params,
-// whisper_full, whisper_full_n_segments, whisper_full_get_segment_text,
-// whisper_free.
-#import "whisper.h"
-
-// ONNX Runtime Objective-C API used by the official KittenTTS 0.8 models.
-#import <onnxruntime.h>
-
 #endif  // IOS_LOCAL_LLM_BRIDGING_HEADER_H

@@ -555,13 +555,6 @@ final class MemoryPressureCoordinator {
         LlamaCppVLMService.shared.unload()
         FastVLMService.shared.unload()
         ImageGenerationService.shared.unload()
-        // Voice weights were previously NOT dumped here — Whisper STT (150 MB–
-        // 1.5 GB) + Kitten/Kokoro TTS (hundreds of MB) stayed pinned during a
-        // voice conversation, defeating the emergency shed exactly when Jetsam
-        // was imminent. This is a safety stop, so accept interrupting any
-        // in-flight utterance.
-        VoiceService.shared.unloadAll()
-        WhisperRuntime.shared.unload()
         Task { await MLXGenerationGate.shared.clearCacheWhenIdle() }
     }
 }

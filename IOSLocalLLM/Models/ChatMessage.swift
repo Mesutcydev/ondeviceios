@@ -3,6 +3,21 @@ import Foundation
 // MARK: - Chat message
 
 public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
+    /// Native function-call metadata retained across an agent conversation.
+    /// Keeping this structured lets MLX render the model's own tool template
+    /// and preserves `tool_call_id` for Hermes/OpenCode follow-up turns.
+    public struct ToolCallMetadata: Codable, Hashable, Sendable {
+        public let id: String
+        public let name: String
+        public let argumentsJSON: String
+
+        public init(id: String, name: String, argumentsJSON: String) {
+            self.id = id
+            self.name = name
+            self.argumentsJSON = argumentsJSON
+        }
+    }
+
     public let id: UUID
     public let role: Role
     public var content: String
@@ -42,6 +57,10 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     /// conversations written by older builds decode unchanged.
     public var generationModelID: String? = nil
     public var generationExecutionLocation: ModelExecutionLocation? = nil
+    /// Calls produced by an assistant turn, if any.
+    public var toolCalls: [ToolCallMetadata]? = nil
+    /// Correlates a `.tool` result with the assistant call it answers.
+    public var toolCallID: String? = nil
 
     /// A single image attachment in an interleaved message.
     public struct ImageAttachment: Codable, Hashable, Sendable {
@@ -76,7 +95,9 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         generationTokensPerSecond: Double? = nil,
         generationDuration: TimeInterval? = nil,
         generationModelID: String? = nil,
-        generationExecutionLocation: ModelExecutionLocation? = nil
+        generationExecutionLocation: ModelExecutionLocation? = nil,
+        toolCalls: [ToolCallMetadata]? = nil,
+        toolCallID: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -93,6 +114,8 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         self.generationDuration = generationDuration
         self.generationModelID = generationModelID
         self.generationExecutionLocation = generationExecutionLocation
+        self.toolCalls = toolCalls
+        self.toolCallID = toolCallID
     }
 
     public static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
@@ -108,7 +131,9 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         lhs.generationTokensPerSecond == rhs.generationTokensPerSecond &&
         lhs.generationDuration == rhs.generationDuration &&
         lhs.generationModelID == rhs.generationModelID &&
-        lhs.generationExecutionLocation == rhs.generationExecutionLocation
+        lhs.generationExecutionLocation == rhs.generationExecutionLocation &&
+        lhs.toolCalls == rhs.toolCalls &&
+        lhs.toolCallID == rhs.toolCallID
     }
 
     public func hash(into hasher: inout Hasher) {
@@ -125,6 +150,8 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         hasher.combine(generationDuration)
         hasher.combine(generationModelID)
         hasher.combine(generationExecutionLocation)
+        hasher.combine(toolCalls)
+        hasher.combine(toolCallID)
     }
 
     /// Content supplied to a model prompt. Views and exports continue to use

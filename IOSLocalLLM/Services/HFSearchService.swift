@@ -12,12 +12,19 @@ import Foundation
 @MainActor
 final class HFSearchService: ObservableObject {
 
+    static let shared = HFSearchService()
+
     // MARK: - Published state
 
     @Published private(set) var results: [HFModelSummary] = []
     @Published private(set) var isSearching = false
     @Published private(set) var lastError: String?
     @Published private(set) var lastQuery: String = ""
+
+    /// Monotonic request identity. Search text changes can cancel the view's
+    /// task while URLSession is still unwinding; without an identity check an
+    /// older response can replace the results for the newest query.
+    private var searchGeneration: UInt64 = 0
 
     // MARK: - Filter options
 
@@ -39,10 +46,20 @@ final class HFSearchService: ObservableObject {
             case .all:     return []
             case .mlx:     return ["mlx"]
             case .coreml:  return ["coreml"]
-            case .textGen: return ["text-generation"]
-            case .vlm:     return ["image-text-to-text"]
-            case .tts:     return ["text-to-speech"]
-            case .asr:     return ["automatic-speech-recognition"]
+            case .textGen, .vlm, .tts, .asr: return []
+            }
+        }
+
+        /// Tasks are first-class `pipeline_tag` parameters in the Hub API.
+        /// Sending them as generic `filter` tags works inconsistently and was
+        /// the reason category searches could return an empty list.
+        var pipelineTag: String? {
+            switch self {
+            case .textGen: return "text-generation"
+            case .vlm:     return "image-text-to-text"
+            case .tts:     return "text-to-speech"
+            case .asr:     return "automatic-speech-recognition"
+            case .all, .mlx, .coreml: return nil
             }
         }
     }
@@ -50,55 +67,174 @@ final class HFSearchService: ObservableObject {
     // MARK: - Search
 
     func search(query: String, filter: Filter = .all, limit: Int = 30) async {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = Self.normalizedQuery(query)
         // Allow filter-only browsing (empty query) when the caller has picked
         // a non-.all filter — that's how the download manager's "browse visual
         // models" / "browse audio models" landing pages populate without
         // forcing the user to type a keyword first.
-        if trimmed.isEmpty && filter.hfFilters.isEmpty {
-            results = []
+        if trimmed.isEmpty && filter.hfFilters.isEmpty && filter.pipelineTag == nil {
+            clear()
             return
         }
 
+        searchGeneration &+= 1
+        let generation = searchGeneration
         isSearching = true
-        defer { isSearching = false }
         lastError  = nil
         lastQuery  = trimmed
 
         do {
-            var components = URLComponents(string: "https://huggingface.co/api/models")!
-            var items: [URLQueryItem] = [
-                URLQueryItem(name: "limit",  value: String(limit)),
-                URLQueryItem(name: "sort",   value: "downloads"),
-                URLQueryItem(name: "direction", value: "-1"),
-                URLQueryItem(name: "full",   value: "true"),
-            ]
-            if !trimmed.isEmpty {
-                items.append(URLQueryItem(name: "search", value: trimmed))
+            guard let url = Self.searchURL(query: trimmed, filter: filter, limit: limit) else {
+                throw HFSearchError.invalidQuery
             }
-            for f in filter.hfFilters {
-                items.append(URLQueryItem(name: "filter", value: f))
-            }
-            components.queryItems = items
-            guard let url = components.url else { throw URLError(.badURL) }
 
             var request = URLRequest(url: url)
             request.timeoutInterval = 20
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("OnDeviceLAS/3.2.6 (iOS; Hugging Face model search)", forHTTPHeaderField: "User-Agent")
             // Attach HF token when present + enabled — lets the user
             // discover gated repos they have access to.
             HFTokenStore.authorize(&request)
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                throw URLError(.badServerResponse)
+            try Self.validate(response: response, data: data)
+            var decoded = try Self.decodeResults(data)
+
+            // A pasted owner/repository path should work even when ranked
+            // search returns nothing. Query the canonical model endpoint and
+            // prepend the exact match when it exists.
+            if trimmed.contains("/"),
+               let exact = try await Self.fetchExactRepo(trimmed),
+               !decoded.contains(where: { $0.id.caseInsensitiveCompare(exact.id) == .orderedSame }) {
+                decoded.insert(exact, at: 0)
             }
 
-            let raw = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? []
-            results = raw.map(HFModelSummary.init(json:))
+            try Task.checkCancellation()
+            guard generation == searchGeneration else { return }
+            results = Self.deduplicated(decoded)
+            isSearching = false
 
+        } catch is CancellationError {
+            guard generation == searchGeneration else { return }
+            isSearching = false
+        } catch let error as URLError where error.code == .cancelled {
+            guard generation == searchGeneration else { return }
+            isSearching = false
         } catch {
-            lastError = error.localizedDescription
+            guard generation == searchGeneration else { return }
+            lastError = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
             results = []
+            isSearching = false
         }
+    }
+
+    func clear() {
+        searchGeneration &+= 1
+        results = []
+        isSearching = false
+        lastError = nil
+        lastQuery = ""
+    }
+
+    /// Accept a plain term, `owner/repository`, or a copied Hub model URL.
+    static nonisolated func normalizedQuery(_ rawValue: String) -> String {
+        var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return "" }
+
+        if !value.contains("://"), value.lowercased().hasPrefix("huggingface.co/") {
+            value = "https://" + value
+        }
+        if let url = URL(string: value),
+           let host = url.host?.lowercased(),
+           host == "huggingface.co" || host == "www.huggingface.co" {
+            let parts = url.pathComponents.filter { $0 != "/" }
+            if parts.count >= 2 {
+                return stripGitSuffix("\(parts[0])/\(parts[1])")
+            }
+        }
+        return stripGitSuffix(
+            value.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        )
+    }
+
+    private static nonisolated func stripGitSuffix(_ value: String) -> String {
+        value.hasSuffix(".git") ? String(value.dropLast(4)) : value
+    }
+
+    static nonisolated func searchURL(
+        query: String,
+        filter: Filter,
+        limit: Int
+    ) -> URL? {
+        var components = URLComponents(string: "https://huggingface.co/api/models")
+        var items: [URLQueryItem] = [
+            URLQueryItem(name: "limit", value: String(min(max(limit, 1), 100))),
+            URLQueryItem(name: "sort", value: "downloads"),
+            URLQueryItem(name: "direction", value: "-1"),
+            URLQueryItem(name: "full", value: "true")
+        ]
+        if !query.isEmpty {
+            items.append(URLQueryItem(name: "search", value: query))
+        }
+        items.append(contentsOf: filter.hfFilters.map {
+            URLQueryItem(name: "filter", value: $0)
+        })
+        if let pipelineTag = filter.pipelineTag {
+            items.append(URLQueryItem(name: "pipeline_tag", value: pipelineTag))
+        }
+        components?.queryItems = items
+        return components?.url
+    }
+
+    static nonisolated func decodeResults(_ data: Data) throws -> [HFModelSummary] {
+        guard let raw = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw HFSearchError.invalidResponse
+        }
+        return raw.map(HFModelSummary.init(json:)).filter { $0.id != "unknown" }
+    }
+
+    private static nonisolated func validate(response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw HFSearchError.invalidResponse
+        }
+        switch http.statusCode {
+        case 200..<300:
+            return
+        case 401, 403:
+            throw HFSearchError.authenticationRequired
+        case 429:
+            throw HFSearchError.rateLimited
+        default:
+            let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let serverMessage = payload?["error"] as? String
+                ?? payload?["message"] as? String
+            throw HFSearchError.server(status: http.statusCode, message: serverMessage)
+        }
+    }
+
+    private static func fetchExactRepo(_ repoID: String) async throws -> HFModelSummary? {
+        var components = URLComponents(string: "https://huggingface.co")
+        components?.path = "/api/models/\(repoID)"
+        guard let url = components?.url else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("OnDeviceLAS/3.2.6 (iOS; Hugging Face model search)", forHTTPHeaderField: "User-Agent")
+        HFTokenStore.authorize(&request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { return nil }
+        if http.statusCode == 404 { return nil }
+        try validate(response: response, data: data)
+        guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw HFSearchError.invalidResponse
+        }
+        let result = HFModelSummary(json: raw)
+        return result.id == "unknown" ? nil : result
+    }
+
+    private static nonisolated func deduplicated(_ models: [HFModelSummary]) -> [HFModelSummary] {
+        var seen = Set<String>()
+        return models.filter { seen.insert($0.id.lowercased()).inserted }
     }
 
     // MARK: - Repo file size estimate (for cards)
@@ -197,6 +333,32 @@ final class HFSearchService: ObservableObject {
             return total > 0 ? total : nil
         } catch {
             return nil
+        }
+    }
+}
+
+enum HFSearchError: LocalizedError {
+    case invalidQuery
+    case invalidResponse
+    case authenticationRequired
+    case rateLimited
+    case server(status: Int, message: String?)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidQuery:
+            return "The Hugging Face search query could not be encoded."
+        case .invalidResponse:
+            return "Hugging Face returned an unreadable model list."
+        case .authenticationRequired:
+            return "Hugging Face rejected this search. Add or update your token, then retry."
+        case .rateLimited:
+            return "Hugging Face is rate-limiting searches. Wait a moment, then retry."
+        case .server(let status, let message):
+            if let message, !message.isEmpty {
+                return "Hugging Face search failed (HTTP \(status)): \(message)"
+            }
+            return "Hugging Face search failed with HTTP \(status)."
         }
     }
 }

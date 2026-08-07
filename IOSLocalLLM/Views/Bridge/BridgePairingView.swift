@@ -756,25 +756,31 @@ private struct LocalAPIServerCard: View {
                     .font(theme.sans(12))
                     .foregroundColor(theme.warn)
             } else {
-                ForEach(manager.addresses, id: \.self) { address in
+                ForEach(Array(connectionEntries(port: port).enumerated()), id: \.offset) { _, entry in
                     CopyableAPIEndpoint(
-                        label: "OpenAI",
-                        value: "http://\(address):\(port)/v1",
-                        theme: theme
-                    )
-                    CopyableAPIEndpoint(
-                        label: "Ollama",
-                        value: "http://\(address):\(port)",
-                        theme: theme
-                    )
-                    CopyableAPIEndpoint(
-                        label: "Anthropic",
-                        value: "http://\(address):\(port)",
+                        label: entry.label,
+                        value: entry.value,
                         theme: theme
                     )
                 }
             }
         }
+    }
+
+    private func connectionEntries(port: UInt16) -> [(label: String, value: String)] {
+        var seen = Set<String>()
+        var entries: [(label: String, value: String)] = []
+        for address in manager.addresses {
+            let openAI = "http://\(address):\(port)/v1"
+            let localBase = "http://\(address):\(port)"
+            if seen.insert(openAI).inserted {
+                entries.append(("OpenAI", openAI))
+            }
+            if seen.insert(localBase).inserted {
+                entries.append(("Ollama · Anthropic", localBase))
+            }
+        }
+        return entries
     }
 
     private var keyControls: some View {

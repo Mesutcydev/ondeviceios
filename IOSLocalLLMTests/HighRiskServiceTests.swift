@@ -41,6 +41,54 @@ final class ModelDownloadCenterServiceTests: XCTestCase {
 }
 
 final class CodingAssistantServicePolicyTests: XCTestCase {
+    func testStaleMLXGenerationCannotPublishOverCurrentGeneration() {
+        let current = UUID()
+        let stale = UUID()
+
+        XCTAssertTrue(AssistantGenerationOwnership.isCurrent(
+            activeID: current,
+            completingID: current
+        ))
+        XCTAssertFalse(AssistantGenerationOwnership.isCurrent(
+            activeID: current,
+            completingID: stale
+        ))
+        XCTAssertFalse(AssistantGenerationOwnership.isCurrent(
+            activeID: nil,
+            completingID: stale
+        ))
+    }
+
+    func testBackgroundCleanupNeverWaitsForMetalOrUnloadsItsRuntime() {
+        let actions = LifecycleBackgroundCleanupPlan.referenceCompatible.actions
+
+        XCTAssertEqual(actions, [.cancelQueuedMLX])
+        XCTAssertFalse(actions.contains(.awaitNativeGeneration))
+        XCTAssertFalse(actions.contains(.unloadResidentRuntimes))
+    }
+
+    func testTransitionOwnedUnloadNeverDrainsItsOwnTask() {
+        XCTAssertTrue(AssistantUnloadDrainPolicy.transitionOwned.loadTask)
+        XCTAssertFalse(AssistantUnloadDrainPolicy.transitionOwned.transitionTask)
+    }
+
+    func testLoadOwnedUnloadCannotDrainEitherPossibleOwner() {
+        XCTAssertFalse(AssistantUnloadDrainPolicy.loadOwned.loadTask)
+        XCTAssertFalse(AssistantUnloadDrainPolicy.loadOwned.transitionTask)
+    }
+
+    func testExternalUnloadDrainsAllServiceOwnedWork() {
+        XCTAssertTrue(AssistantUnloadDrainPolicy.external.loadTask)
+        XCTAssertTrue(AssistantUnloadDrainPolicy.external.transitionTask)
+    }
+
+    func testGGUFBackendComputeFailureHasActionableDescription() {
+        XCTAssertEqual(
+            LlamaCppError.decodeFailed(-3).errorDescription,
+            "llama.cpp backend compute failed while decoding (code -3)"
+        )
+    }
+
     func testStorageBackedGGUFPolicyDisablesGPULayersAndBoundsHeadroom() {
         let policy = GGUFLoadPolicy.resolve(
             fileBytes: 8 * 1_024 * 1_024 * 1_024,
@@ -66,7 +114,27 @@ final class CodingAssistantServicePolicyTests: XCTestCase {
         XCTAssertGreaterThan(policy.minimumAvailableBytes, 4_000_000_000)
     }
 
-    func testDisabledLowMemoryPolicyDoesNotOverrideAllocatorLimits() {
+    func testEntitledGGUFReloadAllowsOnlyNarrowReclamationGap() {
+        let policy = GGUFLoadPolicy.resolve(
+            fileBytes: 7_505_194_272,
+            pagingEnabled: false
+        )
+
+        XCTAssertTrue(policy.canAdmit(
+            availableBytes: policy.minimumAvailableBytes - 64_000_000,
+            hasIncreasedMemoryEntitlement: true
+        ))
+        XCTAssertFalse(policy.canAdmit(
+            availableBytes: policy.minimumAvailableBytes - 64_000_000,
+            hasIncreasedMemoryEntitlement: false
+        ))
+        XCTAssertFalse(policy.canAdmit(
+            availableBytes: policy.minimumAvailableBytes - 256_000_000,
+            hasIncreasedMemoryEntitlement: true
+        ))
+    }
+
+    func testStandardMLXPolicyUsesNativeAllocatorDefaults() {
         let policy = MLXLowMemoryPolicy.resolve(
             enabled: false,
             physicalMemoryBytes: 8_000_000_000,

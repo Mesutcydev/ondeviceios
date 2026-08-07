@@ -1,8 +1,10 @@
 # Fork and signing configuration
 
-A fork must use identifiers owned by its Apple development team. Changing only
-the app bundle identifier is insufficient because the share extension, App
-Group, CloudKit container, and two runtime constants must agree.
+A fork must use identifiers owned by its Apple development team. The current
+`OnDeviceLAS` target is server-only and contains one app target plus its unit
+tests; the legacy assistant, share-extension, App Group, and CloudKit
+surfaces remain in the source tree for reference but are not linked by this
+build.
 
 ## Required replacements
 
@@ -10,13 +12,8 @@ Choose a reverse-DNS prefix such as `com.example.localllm`, then replace:
 
 | Existing value | Where it must remain consistent |
 | --- | --- |
-| `com.mesutcydev.ioslocalllm.IOSLocalLLM` | app target bundle ID |
-| `com.mesutcydev.ioslocalllm.IOSLocalLLM.share` | share extension bundle ID |
-| `com.mesutcydev.ioslocalllm.IOSLocalLLMTests` | unit-test bundle ID |
-| `com.mesutcydev.ioslocalllm.IOSLocalLLMUITests` | UI-test bundle ID |
-| `group.com.mesutcydev.ioslocalllm.shared` | all app/share/PCC/Catalyst entitlements, `AppBridge.swift`, and `ShareViewController.swift` |
-| `iCloud.com.mesutcydev.ioslocalllm` | app/PCC/Catalyst entitlements and `CloudSyncService.swift` |
-| `com.mesutcydev.ioslocalllm.scheme` | URL type name in `project.yml` |
+| `com.mesutcydev.ondevicelas` | app target bundle ID in `project.yml` |
+| `com.mesutcydev.ondevicelas.tests` | unit-test bundle ID in `project.yml` |
 
 Make target-level changes in `project.yml`, then update the tracked entitlement
 and Swift files. Regenerate with:
@@ -33,10 +30,9 @@ collisions with another installed distribution.
 
 ## Capabilities
 
-Create the App Group and CloudKit container in your own Apple developer account
-before device signing. If your signing profile does not grant increased memory
-limit, extended virtual addressing, iCloud, or a newer Foundation Models
-capability, remove only the unavailable entitlement and test the resulting
+The current target does not require an App Group or CloudKit container. If your
+signing profile does not grant increased memory limit or extended virtual
+addressing, remove only the unavailable entitlement and test the resulting
 limits. Do not publish a profile, certificate, `.p8`, `.p12`,
 `.mobileprovision`, team ID, or private CloudKit credential.
 

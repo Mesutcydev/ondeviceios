@@ -1,7 +1,23 @@
 import Foundation
 import os
+import Security
 #if canImport(UIKit)
 import UIKit
+#endif
+
+#if os(iOS) && !targetEnvironment(simulator) && !targetEnvironment(macCatalyst)
+// Security.framework exports these on iOS, but the Swift overlay does not
+// expose SecTask declarations. Keep the ABI bridge local and minimal so the
+// running code signature—not the source .entitlements file—is authoritative.
+@_silgen_name("SecTaskCreateFromSelf")
+private func LASCreateSecurityTask(_ allocator: CFAllocator?) -> CFTypeRef?
+
+@_silgen_name("SecTaskCopyValueForEntitlement")
+private func LASCopyEntitlementValue(
+    _ task: CFTypeRef,
+    _ entitlement: CFString,
+    _ error: UnsafeMutablePointer<Unmanaged<CFError>?>?
+) -> CFTypeRef?
 #endif
 
 // MARK: - MemoryAdvisor
@@ -49,11 +65,17 @@ enum MemoryAdvisor {
     // models — the transient is already inside the peak estimate.
     static let loadHeadroomReserve: Int64 = 500_000_000
 
-    // Reserve used in edge / developer mode (`AppSettings.showEdgeModels`).
-    // Zero so a "tight" model whose peak just fits the live ceiling is allowed
-    // to load. This is the opt-in risky path; the normal path keeps the full
-    // `loadHeadroomReserve` and therefore can never be coaxed into an OOM.
+    // Reserve used by paging-capable runtimes in edge / developer mode.
+    // MLX always keeps `loadHeadroomReserve`: its weights materialize eagerly.
     static let edgeHeadroomReserve: Int64 = 0
+
+    /// Rounding and kernel-accounting jitter can make a model with a previously
+    /// observed successful peak appear short by a few dozen MB. A disk-size
+    /// estimate is NOT sufficient: Build 116 proved that `weights × 1.3` can
+    /// understate an imported Gemma load transient and iOS will jetsam before
+    /// MLX reports allocator progress. The grace therefore requires a
+    /// calibrated successful peak in addition to the entitlement.
+    static let entitledNearFitGrace: Int64 = 128 * 1_024 * 1_024
 
     // Conservative footprint assumed when a model can't be sized (custom /
     // imported repos with no preset match and no readable on-disk folder).
@@ -169,10 +191,10 @@ enum MemoryAdvisor {
     //
     // IOSLocalLLM ships the `increased-memory-limit` entitlement. On some devices
     // `os_proc_available_memory()` under-reports, so we fuse that signal with
-    // an empirical per-tier fraction of physical RAM. The result still needs a
-    // platform cap: build 45 proved that a 12 GB iPhone can report ~9.2 GB of
-    // apparent headroom and then be Jetsam-killed around a 5.6 GB footprint.
-    // iPad and Mac keep the scalable estimate; iPhone uses the validated bound.
+    // an empirical per-tier fraction of physical RAM. The MLX allocator uses
+    // TokenAI's validated 0.74 physical-RAM limit; the process cap below keeps
+    // the UI/admission math in the same envelope without allowing the cache to
+    // grow unbounded. iPad and Mac keep the scalable estimate.
 
     /// Fraction of physical RAM the app can realistically use as a hard ceiling
     /// on this device class. Tuned empirically against the entitled per-process
@@ -195,12 +217,32 @@ enum MemoryAdvisor {
     static let maximumIPhoneProcessCeiling: Int64 = 6_200_000_000
 
     /// 12 GB Pro Max devices have a materially larger entitled process budget.
-    /// Keep ~3.7 GB outside IOSLocalLLM while allowing a 5–6 GB quantized model
-    /// plus its measured load envelope. The previous universal 6.2 GB clamp
-    /// was introduced while stale MLX loads could overlap; after serializing
-    /// model loads it unnecessarily rejects Ornith 9B on this tier.
-    static let maximumHighMemoryIPhoneProcessCeiling: Int64 = 8_500_000_000
+    /// Keep the admission envelope aligned with TokenAI's 0.74 MLX allocator
+    /// limit (about 9.1 GB on the reference device) while retaining a small
+    /// rounding margin for UI and runtime bookkeeping.
+    static let maximumHighMemoryIPhoneProcessCeiling: Int64 = 9_200_000_000
     static let highMemoryIPhoneRAMThreshold: Int64 = 10_000_000_000
+
+    /// Whether the entitlement is present in the signature iOS is actually
+    /// running. Declaring the key in the source entitlements file is not
+    /// sufficient: an unsigned IPA, or a sideloading profile that does not
+    /// grant it, runs with the normal process memory limit.
+    static var hasIncreasedMemoryLimitEntitlement: Bool {
+        #if os(iOS) && !targetEnvironment(simulator) && !targetEnvironment(macCatalyst)
+        guard let task = LASCreateSecurityTask(nil),
+              let value = LASCopyEntitlementValue(
+                task,
+                "com.apple.developer.kernel.increased-memory-limit" as CFString,
+                nil
+              ) else {
+            return false
+        }
+        return (value as? Bool) == true
+        #else
+        // Simulator and Catalyst are not governed by iOS Jetsam provisioning.
+        return true
+        #endif
+    }
 
     private static var isIPhoneProcess: Bool {
         #if os(iOS) && !targetEnvironment(macCatalyst)
@@ -226,6 +268,22 @@ enum MemoryAdvisor {
         return min(max(0, candidate), platformCap)
     }
 
+    /// Selects the ceiling signal that is legal for the running signature.
+    /// The synthetic entitlement estimate must never override the kernel when
+    /// the installed profile did not grant increased memory, or the UI admits
+    /// a load that iOS will terminate as soon as weights are materialized.
+    static nonisolated func resolvedProcessCeilingCandidate(
+        kernelCeiling: Int64,
+        entitlementCeiling: Int64,
+        hasIncreasedMemoryEntitlement: Bool,
+        lowPowerMode: Bool
+    ) -> Int64 {
+        guard hasIncreasedMemoryEntitlement, !lowPowerMode else {
+            return kernelCeiling
+        }
+        return max(kernelCeiling, entitlementCeiling)
+    }
+
     /// Best estimate of this process's hard memory ceiling (the per-process
     /// limit iOS enforces), in bytes — independent of what is loaded right now.
     ///
@@ -238,8 +296,8 @@ enum MemoryAdvisor {
     ///     switch to Assistant, 4B won't load" regression. See `physFootprint`.)
     ///   • Entitlement: `physicalRAM × tierFraction`. Recovers the headroom the
     ///     kernel signal hides on entitled devices.
-    /// Clamped to `physicalRAM − 1.5 GB`; iPhone is additionally capped at
-    /// the empirically validated 6.2 GB process budget.
+    /// Clamped to `physicalRAM − 1.5 GB`; iPhone is additionally capped at its
+    /// entitlement-aware tier budget.
     static var processMemoryCeiling: Int64 {
         let avail = processAvailableMemory
         let footprint = physFootprint
@@ -247,7 +305,12 @@ enum MemoryAdvisor {
             ? avail + footprint
             : (avail > 0 ? avail + max(0, deviceTotalRAM - nonResidentRAMEstimate) : 0)
         let entitlementCeiling = Int64(Double(deviceTotalRAM) * entitlementCeilingFraction)
-        let best = max(kernelCeiling, entitlementCeiling)
+        let best = resolvedProcessCeilingCandidate(
+            kernelCeiling: kernelCeiling,
+            entitlementCeiling: entitlementCeiling,
+            hasIncreasedMemoryEntitlement: hasIncreasedMemoryLimitEntitlement,
+            lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled
+        )
         let fallback = best > 0 ? best : availableRAM
         return clampedProcessCeiling(
             candidate: fallback,
@@ -333,9 +396,26 @@ enum MemoryAdvisor {
         //    gate does not multiply it again.
         if let repoID = nonPresetRepoID(from: modelID),
            let onDisk = onDiskWeightsSize(forRepoID: repoID), onDisk > 0 {
-            return Int64(Double(onDisk) * workingSetOverhead)
+            return estimatedPeakFootprint(
+                weightBytes: onDisk,
+                profile: ModelCapabilityProfile.resolve(repoID: repoID)
+            )
         }
         return 0
+    }
+
+    /// Includes the fully populated, bounded KV cache in the peak estimate.
+    /// The weight-only multiplier remains the floor for models whose cache is
+    /// small; large-context profiles use the explicit cache estimate instead
+    /// of relying on a hidden generation-time allocation.
+    static func estimatedPeakFootprint(
+        weightBytes: Int64,
+        profile: ModelCapabilityProfile
+    ) -> Int64 {
+        guard weightBytes > 0 else { return 0 }
+        let weightWorkingSet = Int64(Double(weightBytes) * workingSetOverhead)
+        let cacheAwarePeak = weightBytes + max(0, profile.estimatedKVCacheBytes)
+        return max(weightWorkingSet, cacheAwarePeak)
     }
 
     /// Pulls the bare repoID out of `downloaded:…`, `imported:…`, `custom:…`.
@@ -375,12 +455,34 @@ enum MemoryAdvisor {
 
         let docs = FileManager.default
             .urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let folder = repoID.replacingOccurrences(of: "/", with: "_")
-        let dest = docs.appendingPathComponent("HFModels", isDirectory: true)
-            .appendingPathComponent(folder, isDirectory: true)
-        let result: Int64? = FileManager.default.fileExists(atPath: dest.path)
-            ? (try? FileManager.default.allocatedSizeOfDirectory(at: dest))
-            : nil
+        let flattened = repoID.replacingOccurrences(of: "/", with: "_")
+        let tail = repoID.split(separator: "/").last.map(String.init) ?? repoID
+        let dashed = repoID.replacingOccurrences(of: "/", with: "--")
+        // Imports use `HFModels/<tail>` while catalog downloads generally use
+        // `HFModels/<author>_<repo>`. The old single-path probe knew only the
+        // latter, so a large imported model was treated as an unknown 3.5 GB
+        // model and admitted into MLX even when its actual weights exceeded
+        // the process ceiling. Probe the same storage layouts as the loader.
+        let candidates = [
+            docs.appendingPathComponent("HFModels", isDirectory: true)
+                .appendingPathComponent(flattened, isDirectory: true),
+            docs.appendingPathComponent("HFModels", isDirectory: true)
+                .appendingPathComponent(tail, isDirectory: true),
+            docs.appendingPathComponent("LLMModels", isDirectory: true)
+                .appendingPathComponent(tail, isDirectory: true),
+            docs.appendingPathComponent("huggingface", isDirectory: true)
+                .appendingPathComponent("models", isDirectory: true)
+                .appendingPathComponent(repoID, isDirectory: true),
+            docs.appendingPathComponent("huggingface", isDirectory: true)
+                .appendingPathComponent("hub", isDirectory: true)
+                .appendingPathComponent("models--\(dashed)", isDirectory: true),
+        ]
+        let result = candidates.lazy.compactMap { candidate -> Int64? in
+            guard FileManager.default.fileExists(atPath: candidate.path) else {
+                return nil
+            }
+            return try? FileManager.default.allocatedSizeOfDirectory(at: candidate)
+        }.first(where: { $0 > 0 })
 
         _diskSizeLock.lock()
         _diskSizeCache[repoID] = result ?? -1
@@ -493,7 +595,8 @@ enum MemoryAdvisor {
         for modelID: String,
         allowTightFit: Bool = false,
         runtime: ModelRuntime? = nil,
-        allowUnsafeMemoryLoad: Bool = false
+        allowUnsafeMemoryLoad: Bool = false,
+        measuredFootprintBytes: Int64? = nil
     ) -> String? {
         // Callers that can start MLX work must await
         // `MLXGenerationGate.clearCacheWhenIdle()` before entering this
@@ -505,6 +608,33 @@ enum MemoryAdvisor {
         //    modern silicon and iOS already does its own backoff there.
         if DeviceSafetyMonitor.shared.thermalState == .critical {
             return "Device is too hot to safely load this model. Let it cool for a minute, then retry."
+        }
+
+        // An unentitled sideload cannot opt out of the kernel's hard process
+        // limit. Enforce this before the experimental-memory bypass so an MLX
+        // load cannot knowingly enter a guaranteed Jetsam path.
+        let measuredFootprint = max(
+            0,
+            measuredFootprintBytes ?? estimatedFootprint(for: modelID)
+        )
+
+        if runtime == .mlx, !hasIncreasedMemoryLimitEntitlement {
+            let footprint = measuredFootprint
+            let assumed = footprint > 0 ? footprint : unknownFootprintFloor
+            let reserve = (allowTightFit && runtime != .mlx)
+                ? edgeHeadroomReserve
+                : loadHeadroomReserve
+            let needed = assumed + reserve
+            let kernelBudget = availableMemoryForModel
+            if kernelBudget > 0, needed > kernelBudget {
+                return hardCeilingMessage(
+                    neededBytes: needed,
+                    ceilingBytes: processMemoryCeiling,
+                    runtime: runtime,
+                    lowMemoryEnabled: allowTightFit,
+                    hasIncreasedMemoryEntitlement: false
+                )
+            }
         }
 
         // A user-confirmed experimental attempt bypasses memory-capacity
@@ -520,7 +650,7 @@ enum MemoryAdvisor {
         //     race the kernel's reclaim into a Jetsam kill. A small model that
         //     comfortably fits the live headroom is still allowed to recover.
         if let remaining = pressureCooldownRemaining {
-            let footprint = estimatedFootprint(for: modelID)
+            let footprint = measuredFootprint
             let assumed = footprint > 0 ? footprint : unknownFootprintFloor
             // A model may load during the cooldown if it COMFORTABLY fits the
             // live headroom right now, full reserve kept. The earlier gate also
@@ -543,12 +673,32 @@ enum MemoryAdvisor {
         //    reflects memory the kernel will actually grant, so ignoring it
         //    means a near-certain crash.
         if AppSettings.shared.strictMemoryGate {
-            if case .wontFit(let msg) = verdictWithCurrentlyLoaded(for: modelID) {
-                let footprint = estimatedFootprint(for: modelID)
-                let fitsWithoutReserve = footprint > 0
-                    && footprint <= availableMemoryForModel
-                if !allowTightFit || !fitsWithoutReserve {
+            if case .wontFit(let msg) = verdictWithCurrentlyLoaded(
+                forFootprint: measuredFootprint,
+                excludingModelID: modelID
+            ) {
+                let strictBudget = availableMemoryForModel
+                let strictReserve = AppSettings.shared.showEdgeModels && runtime != .mlx
+                    ? edgeHeadroomReserve
+                    : loadHeadroomReserve
+                let strictNeeded = measuredFootprint + strictReserve
+                let shouldBlock = strictVerdictBlocks(
+                    neededBytes: strictNeeded,
+                    availableBytes: strictBudget,
+                    measuredPeakBytes: measuredFootprint,
+                    allowTightFit: allowTightFit,
+                    runtime: runtime,
+                    hasEntitlement: hasIncreasedMemoryLimitEntitlement,
+                    peakIsCalibrated: false
+                )
+                if shouldBlock {
                     return msg
+                }
+                if strictNeeded > strictBudget {
+                    Diagnostics.shared.breadcrumb(
+                        "strict verdict near-fit override · deficit=\(strictNeeded - strictBudget) · peak=\(measuredFootprint) · available=\(strictBudget)",
+                        category: "memory"
+                    )
                 }
             }
         }
@@ -568,9 +718,46 @@ enum MemoryAdvisor {
         // os_proc_available_memory(): on entitled devices the latter
         // under-reports and refuses models that comfortably fit (the core
         // "device has RAM but the model won't load" report).
+        let hardCeilingFootprint = measuredFootprint > 0
+            ? measuredFootprint
+            : unknownFootprintFloor
+        // MLX low-memory mode bounds allocator/cache retention but cannot page
+        // eagerly materialized weights. Do not drop the load reserve merely
+        // because that mode is enabled; Build 116 demonstrated a jetsam during
+        // local weight materialization before MLX could report progress.
+        let hardCeilingReserve = ((AppSettings.shared.showEdgeModels || allowTightFit)
+            && runtime != .mlx)
+            ? edgeHeadroomReserve
+            : loadHeadroomReserve
+        let hardCeilingNeeded = hardCeilingFootprint + hardCeilingReserve
+        let hardCeiling = processMemoryCeiling
+        if hardCeiling > 0, hardCeilingNeeded > hardCeiling {
+            let nearFit = entitledNearFitAllowed(
+                neededBytes: hardCeilingNeeded,
+                availableBytes: hardCeiling,
+                measuredPeakBytes: hardCeilingFootprint,
+                runtime: runtime,
+                hasEntitlement: hasIncreasedMemoryLimitEntitlement,
+                peakIsCalibrated: false
+            )
+            if !nearFit {
+                return hardCeilingMessage(
+                    neededBytes: hardCeilingNeeded,
+                    ceilingBytes: hardCeiling,
+                    runtime: runtime,
+                    lowMemoryEnabled: allowTightFit,
+                    hasIncreasedMemoryEntitlement: hasIncreasedMemoryLimitEntitlement
+                )
+            }
+            Diagnostics.shared.breadcrumb(
+                "entitled near-fit grace · deficit=\(hardCeilingNeeded - hardCeiling) · peak=\(hardCeilingFootprint) · ceiling=\(hardCeiling)",
+                category: "memory"
+            )
+        }
+
         let procAvail = availableMemoryForModel
         if procAvail > 0 {
-            let footprint = estimatedFootprint(for: modelID)
+            let footprint = measuredFootprint
             let assumed = footprint > 0 ? footprint : unknownFootprintFloor
             // `assumed` is already the peak resident working set (it includes
             // the load transient — see `estimatedFootprint`). Add only a fixed
@@ -578,16 +765,30 @@ enum MemoryAdvisor {
             // is what previously inflated every estimate ~2.5× and refused
             // models that comfortably fit the per-process ceiling.
             //
-            // Edge / developer mode drops the reserve so a "tight" model that
-            // sits right at the ceiling can load — experimental, may be killed
-            // under pressure. A normal user keeps the full reserve, so they
-            // never load anything that would OOM. Either way a model whose peak
-            // genuinely exceeds the live ceiling is still refused.
-            let reserve = (AppSettings.shared.showEdgeModels || allowTightFit)
+            // Edge / developer mode may drop the reserve for paging-capable
+            // runtimes. MLX keeps it because weights cannot be paged and the
+            // disk-derived peak is not a calibrated successful measurement.
+            let reserve = ((AppSettings.shared.showEdgeModels || allowTightFit)
+                && runtime != .mlx)
                 ? edgeHeadroomReserve
                 : loadHeadroomReserve
             let needed = assumed + reserve
             if procAvail < needed {
+                let nearFit = entitledNearFitAllowed(
+                    neededBytes: needed,
+                    availableBytes: procAvail,
+                    measuredPeakBytes: assumed,
+                    runtime: runtime,
+                    hasEntitlement: hasIncreasedMemoryLimitEntitlement,
+                    peakIsCalibrated: false
+                )
+                if nearFit {
+                    Diagnostics.shared.breadcrumb(
+                        "entitled live near-fit grace · deficit=\(needed - procAvail) · peak=\(assumed) · available=\(procAvail)",
+                        category: "memory"
+                    )
+                    return nil
+                }
                 // Distinguish "too big for this device, period" from "would
                 // fit if you freed up what's resident right now." The hard
                 // ceiling (`processMemoryCeiling`) is what this process can
@@ -602,7 +803,8 @@ enum MemoryAdvisor {
                         neededBytes: needed,
                         ceilingBytes: ceiling,
                         runtime: runtime,
-                        lowMemoryEnabled: allowTightFit
+                        lowMemoryEnabled: allowTightFit,
+                        hasIncreasedMemoryEntitlement: hasIncreasedMemoryLimitEntitlement
                     )
                 }
                 return String(
@@ -615,6 +817,64 @@ enum MemoryAdvisor {
         return nil
     }
 
+    static nonisolated func entitledNearFitAllowed(
+        neededBytes: Int64,
+        availableBytes: Int64,
+        measuredPeakBytes: Int64,
+        runtime: ModelRuntime?,
+        hasEntitlement: Bool,
+        peakIsCalibrated: Bool
+    ) -> Bool {
+        guard runtime == .mlx,
+              hasEntitlement,
+              peakIsCalibrated,
+              neededBytes > availableBytes,
+              availableBytes > 0,
+              measuredPeakBytes > 0,
+              measuredPeakBytes <= availableBytes else {
+            return false
+        }
+        return neededBytes - availableBytes <= entitledNearFitGrace
+    }
+
+    /// Resolves the conservative verdict gate before the hard/live ceiling
+    /// checks run. This must mirror the same entitled near-fit policy used by
+    /// those later checks; otherwise `verdictWithCurrentlyLoaded` returns its
+    /// reserve-inclusive warning first and makes the near-fit path unreachable.
+    ///
+    /// `allowTightFit` retains its existing edge-mode behavior: the reserve may
+    /// be dropped only when the measured model peak itself fits. Normal mode is
+    /// narrower and permits only the bounded entitled reserve deficit.
+    static nonisolated func strictVerdictBlocks(
+        neededBytes: Int64,
+        availableBytes: Int64,
+        measuredPeakBytes: Int64,
+        allowTightFit: Bool,
+        runtime: ModelRuntime?,
+        hasEntitlement: Bool,
+        peakIsCalibrated: Bool
+    ) -> Bool {
+        guard neededBytes > availableBytes else { return false }
+
+        let peakFits = availableBytes > 0
+            && measuredPeakBytes > 0
+            && measuredPeakBytes <= availableBytes
+        if allowTightFit,
+           peakFits,
+           runtime != .mlx || peakIsCalibrated {
+            return false
+        }
+
+        return !entitledNearFitAllowed(
+            neededBytes: neededBytes,
+            availableBytes: availableBytes,
+            measuredPeakBytes: measuredPeakBytes,
+            runtime: runtime,
+            hasEntitlement: hasEntitlement,
+            peakIsCalibrated: peakIsCalibrated
+        )
+    }
+
     /// Explains a hard process-ceiling refusal without implying that the
     /// low-memory switch can page every model format. MLX can reduce retained
     /// allocator/KV cache, but its full weights still count against the iOS
@@ -624,10 +884,18 @@ enum MemoryAdvisor {
         neededBytes: Int64,
         ceilingBytes: Int64,
         runtime: ModelRuntime?,
-        lowMemoryEnabled: Bool
+        lowMemoryEnabled: Bool,
+        hasIncreasedMemoryEntitlement: Bool = true
     ) -> String {
         let neededGB = Double(neededBytes) / 1_000_000_000
         let ceilingGB = Double(ceilingBytes) / 1_000_000_000
+        if runtime == .mlx, !hasIncreasedMemoryEntitlement {
+            return String(
+                format: "This installed build is missing the iOS Increased Memory Limit entitlement. The MLX model needs ~%.1f GB, but iOS currently grants this app only ~%.1f GB. Re-sign with a provisioning profile that grants com.apple.developer.kernel.increased-memory-limit, or choose a smaller MLX/GGUF model.",
+                neededGB,
+                ceilingGB
+            )
+        }
         if runtime == .mlx, lowMemoryEnabled {
             return String(
                 format: "This MLX model needs ~%.1f GB, but this app can use ~%.1f GB on this device. Low-memory mode cannot page MLX weights. Choose a smaller MLX model (4B or 1.7B), or import a GGUF quantization for storage-backed paging.",
@@ -649,6 +917,7 @@ enum MemoryAdvisor {
         let normalized = message.lowercased()
         return normalized.contains("this mlx model needs")
             || normalized.contains("model is too large for this device")
+            || normalized.contains("missing the ios increased memory limit entitlement")
     }
 
     // MARK: - Device summary

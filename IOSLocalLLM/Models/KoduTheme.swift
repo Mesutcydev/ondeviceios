@@ -277,7 +277,11 @@ struct KoduTheme {
         default:     base = .light
         }
         let dark = base.isDark
-        if accent == .rose { return base }
+        // NOTE: every palette (including `.rose`) resolves through its own
+        // anchors. The base light/dark/oled themes in this product are neutral
+        // (blue/graphite), so the old `if accent == .rose { return base }`
+        // shortcut made the Rose swatch paint blue. Rose now uses its pink
+        // anchors to match the swatch shown in the picker.
         let a = accent.anchors(dark: dark)
         return KoduTheme(
             bg: base.bg, surface: base.surface, surface2: base.surface2, surface3: base.surface3,

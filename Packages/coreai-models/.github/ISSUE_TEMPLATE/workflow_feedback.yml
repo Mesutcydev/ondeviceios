@@ -1,0 +1,36 @@
+name: Workflow or runtime feedback
+description: Share feedback on the export workflow, Swift runtime utilities, or documentation.
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to suggest improvements to the export workflow, Swift runtime utilities, or documentation. We read every report.
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to build?
+      description: A short description of the app or workflow you are working on.
+    validations:
+      required: true
+  - type: textarea
+    id: unclear
+    attributes:
+      label: Where are the current docs or utilities unclear?
+      description: Point to specific files, commands, READMEs, or APIs that tripped you up.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected improvement
+      description: What would have made this easier? Concrete suggestions are most useful.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Optional. Screenshots, code snippets, or links.
+    validations:
+      required: false

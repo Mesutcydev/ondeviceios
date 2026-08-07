@@ -428,3 +428,64 @@ final class ModelCategoryInferenceTests: XCTestCase {
         }
     }
 }
+
+@MainActor
+final class HFSearchServiceTests: XCTestCase {
+    func test_normalizesCopiedHubModelURLs() {
+        XCTAssertEqual(
+            HFSearchService.normalizedQuery(
+                "https://huggingface.co/mlx-community/Qwen3-4B/tree/main"
+            ),
+            "mlx-community/Qwen3-4B"
+        )
+        XCTAssertEqual(
+            HFSearchService.normalizedQuery("huggingface.co/owner/model.git/resolve/main"),
+            "owner/model"
+        )
+        XCTAssertEqual(HFSearchService.normalizedQuery("  Qwen3 coder  "), "Qwen3 coder")
+    }
+
+    func test_mlxSearchUsesHubFilterAndEncodesRepositoryQuery() throws {
+        let url = try XCTUnwrap(HFSearchService.searchURL(
+            query: "mlx-community/Qwen 3",
+            filter: .mlx,
+            limit: 250
+        ))
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let values = Dictionary(grouping: components.queryItems ?? [], by: \.name)
+
+        XCTAssertEqual(values["search"]?.first?.value, "mlx-community/Qwen 3")
+        XCTAssertEqual(values["filter"]?.first?.value, "mlx")
+        XCTAssertNil(values["pipeline_tag"])
+        XCTAssertEqual(values["limit"]?.first?.value, "100")
+        XCTAssertEqual(values["full"]?.first?.value, "true")
+    }
+
+    func test_taskSearchUsesPipelineTagRatherThanGenericFilter() throws {
+        let url = try XCTUnwrap(HFSearchService.searchURL(
+            query: "vision",
+            filter: .vlm,
+            limit: 30
+        ))
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let values = Dictionary(grouping: components.queryItems ?? [], by: \.name)
+
+        XCTAssertEqual(values["pipeline_tag"]?.first?.value, "image-text-to-text")
+        XCTAssertNil(values["filter"])
+    }
+
+    func test_decodesBothHubIdentifierShapesAndMetadata() throws {
+        let json = #"[
+          {"modelId":"mlx-community/Qwen3-4B","downloads":123,"likes":7,"tags":["mlx","license:apache-2.0"],"pipeline_tag":"text-generation"},
+          {"id":"owner/vision-model","downloads":9,"likes":2,"tags":["coreml"],"pipeline_tag":"image-text-to-text"}
+        ]"#
+        let models = try HFSearchService.decodeResults(Data(json.utf8))
+
+        XCTAssertEqual(models.map(\.id), ["mlx-community/Qwen3-4B", "owner/vision-model"])
+        XCTAssertEqual(models[0].downloads, 123)
+        XCTAssertEqual(models[0].licenseTag, "apache-2.0")
+        XCTAssertTrue(models[0].isMLX)
+        XCTAssertEqual(models[1].pipelineTag, "image-text-to-text")
+        XCTAssertTrue(models[1].isCoreML)
+    }
+}

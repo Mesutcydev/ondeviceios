@@ -1,0 +1,92 @@
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "31 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift:
+    name: Swift security analysis
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout source and pinned submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
+      - name: Install locked CocoaPods dependencies
+        run: pod install --deployment
+
+      - name: Derive the native framework cache key
+        id: native-cache-key
+        run: |
+          native_hash="$(
+            {
+              git submodule status
+              git hash-object \
+                Patches/llama.cpp-ios-only-xcframework.patch \
+                scripts/build_native_frameworks.sh \
+                scripts/native/build_whisper_ios.sh
+            } | shasum -a 256 | awk '{ print $1 }'
+          )"
+          echo "key=native-ios-${RUNNER_OS}-${RUNNER_ARCH}-${native_hash}" >>"$GITHUB_OUTPUT"
+
+      - name: Restore pinned native frameworks
+        id: native-cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ThirdParty/llama.cpp/build-apple/llama.xcframework
+            ThirdParty/whisper.cpp/build-apple/whisper.xcframework
+          key: ${{ steps.native-cache-key.outputs.key }}
+
+      - name: Build pinned native inference frameworks
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: ./scripts/build_native_frameworks.sh
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          languages: swift
+          build-mode: manual
+          queries: security-extended
+
+      - name: Build the iOS app for analysis
+        run: |
+          xcodebuild \
+            -workspace OnDeviceLAS.xcworkspace \
+            -scheme OnDeviceLAS \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Analyze Swift
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          category: /language:swift

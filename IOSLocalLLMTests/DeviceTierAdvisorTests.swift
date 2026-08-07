@@ -1,5 +1,9 @@
 import XCTest
+#if canImport(OnDeviceLAS)
+@testable import OnDeviceLAS
+#else
 @testable import IOSLocalLLM
+#endif
 
 // MARK: - DeviceTierAdvisorTests
 //
@@ -142,6 +146,42 @@ final class DeviceTierAdvisorTests: XCTestCase {
         )
     }
 
+    func test_processCeilingDoesNotUseSyntheticBudgetWithoutEntitlement() {
+        XCTAssertEqual(
+            MemoryAdvisor.resolvedProcessCeilingCandidate(
+                kernelCeiling: 3_540_000_000,
+                entitlementCeiling: 9_200_000_000,
+                hasIncreasedMemoryEntitlement: false,
+                lowPowerMode: false
+            ),
+            3_540_000_000
+        )
+    }
+
+    func test_processCeilingUsesEntitledBudgetWhenGranted() {
+        XCTAssertEqual(
+            MemoryAdvisor.resolvedProcessCeilingCandidate(
+                kernelCeiling: 3_540_000_000,
+                entitlementCeiling: 9_200_000_000,
+                hasIncreasedMemoryEntitlement: true,
+                lowPowerMode: false
+            ),
+            9_200_000_000
+        )
+    }
+
+    func test_lowPowerModeFallsBackToKernelCeiling() {
+        XCTAssertEqual(
+            MemoryAdvisor.resolvedProcessCeilingCandidate(
+                kernelCeiling: 3_540_000_000,
+                entitlementCeiling: 9_200_000_000,
+                hasIncreasedMemoryEntitlement: true,
+                lowPowerMode: true
+            ),
+            3_540_000_000
+        )
+    }
+
     func test_ornithEnvelopeFitsOnlyHighMemoryIPhoneTier() {
         let ornithRequired: Int64 = 7_800_000_000
         let highMemoryCeiling = MemoryAdvisor.clampedProcessCeiling(
@@ -209,9 +249,9 @@ final class DeviceTierAdvisorTests: XCTestCase {
         )
         let profile = MLXAssistantExecutionProfile.resolve(repoID: model.repoID)
 
-        XCTAssertEqual(profile.maxContextTokens, 2_048)
-        XCTAssertEqual(profile.maxOutputTokens, 128)
-        XCTAssertEqual(profile.maxKVSize, 2_048)
+        XCTAssertEqual(profile.maxContextTokens, 32_768)
+        XCTAssertEqual(profile.maxOutputTokens, 2_048)
+        XCTAssertEqual(profile.maxKVSize, 32_768)
         XCTAssertEqual(profile.kvBits, 4)
         XCTAssertEqual(profile.prefillStepSize, 128)
         XCTAssertEqual(profile.cacheLimitBytes, 0)
@@ -227,12 +267,52 @@ final class DeviceTierAdvisorTests: XCTestCase {
             repoID: "mlx-community/Ornith-1.0-9B-4bit"
         )
 
-        XCTAssertEqual(profile.maxContextTokens, 4_096)
-        XCTAssertEqual(profile.maxOutputTokens, 256)
-        XCTAssertEqual(profile.maxKVSize, 4_096)
+        XCTAssertEqual(profile.maxContextTokens, 65_536)
+        XCTAssertEqual(profile.maxOutputTokens, 4_096)
+        XCTAssertEqual(profile.maxKVSize, 65_536)
         XCTAssertEqual(profile.kvBits, 4)
         XCTAssertEqual(profile.prefillStepSize, 128)
         XCTAssertEqual(profile.cacheLimitBytes, 0)
+    }
+
+    func test_modelCapabilityProfilesExposeRealAgentContextAndParsers() {
+        let qwen = ModelCapabilityProfile.resolve(repoID: "mlx-community/Qwen3-8B-4bit")
+        XCTAssertEqual(qwen.configuredContextLength, 65_536)
+        XCTAssertEqual(qwen.maximumKVCacheTokens, 65_536)
+        XCTAssertGreaterThan(qwen.estimatedKVCacheBytes, 0)
+        XCTAssertGreaterThanOrEqual(
+            MemoryAdvisor.estimatedPeakFootprint(
+                weightBytes: 4_000_000_000,
+                profile: qwen
+            ),
+            4_000_000_000 + qwen.estimatedKVCacheBytes,
+            "The bounded 65K KV cache must be included in admission estimates"
+        )
+        XCTAssertEqual(qwen.toolParser, .hermes)
+        XCTAssertTrue(qwen.requiresYaRNContextExtension)
+
+        let ornith = ModelCapabilityProfile.resolve(repoID: "mlx-community/Ornith-1.0-9B-4bit")
+        XCTAssertEqual(ornith.toolParser, .qwen3XML)
+        XCTAssertEqual(ornith.reasoningParser, .qwen3)
+        XCTAssertEqual(ornith.effectiveParallelLimit(requestAllowsParallel: true, globalEnabled: true), 2)
+        XCTAssertEqual(
+            ornith.effectiveParallelLimit(
+                requestAllowsParallel: true,
+                globalEnabled: true,
+                configuredMaximumCalls: 1
+            ),
+            1
+        )
+        XCTAssertEqual(
+            ornith.effectiveParallelLimit(
+                requestAllowsParallel: true,
+                globalEnabled: true,
+                configuredMaximumCalls: 4
+            ),
+            2,
+            "The user ceiling must not exceed the active model profile's safety cap"
+        )
+        XCTAssertTrue(ornith.isHermesContextCompatible)
     }
 
     func test_dottedQwen35AssistantProfileBoundsMemoryWithoutTruncatingReplies() {
@@ -240,12 +320,9 @@ final class DeviceTierAdvisorTests: XCTestCase {
             repoID: "local/MLX-Qwen3.5-9B-Claude-Reasoning-Distilled-v2-4bit"
         )
 
-        XCTAssertEqual(profile.maxContextTokens, 2_048)
-        XCTAssertNil(
-            profile.maxOutputTokens,
-            "Reasoning and visible answer tokens must follow the user's response-length setting"
-        )
-        XCTAssertEqual(profile.maxKVSize, 2_048)
+        XCTAssertEqual(profile.maxContextTokens, 65_536)
+        XCTAssertEqual(profile.maxOutputTokens, 4_096)
+        XCTAssertEqual(profile.maxKVSize, 65_536)
         XCTAssertEqual(profile.kvBits, 4)
         XCTAssertEqual(profile.prefillStepSize, 128)
         XCTAssertEqual(profile.cacheLimitBytes, 0)
@@ -255,8 +332,8 @@ final class DeviceTierAdvisorTests: XCTestCase {
                 deviceContextCap: 8_192,
                 requestedOutputTokens: 2_048
             ),
-            1_536,
-            "A rotating cache must retain meaningful prompt history even when the response allowance is 2K"
+            5_888,
+            "The caller-provided 8K cap must retain prompt room after a 2K response allowance"
         )
     }
 
@@ -464,7 +541,7 @@ final class DeviceTierAdvisorTests: XCTestCase {
         XCTAssertEqual(policy.cacheLimitBytes, 0)
     }
 
-    func test_disabledMLXLowMemoryPolicyLeavesAllocatorUntouched() {
+    func test_standardMLXPolicyUsesNativeAllocatorDefaults() {
         let policy = MLXLowMemoryPolicy.resolve(
             enabled: false,
             physicalMemoryBytes: 8_000_000_000,
@@ -502,10 +579,117 @@ final class DeviceTierAdvisorTests: XCTestCase {
         XCTAssertTrue(MemoryAdvisor.isHardCapacityFailure(message))
     }
 
+    func test_unentitledMLXHardCeilingExplainsSigningRequirement() {
+        let message = MemoryAdvisor.hardCeilingMessage(
+            neededBytes: 7_800_000_000,
+            ceilingBytes: 3_540_000_000,
+            runtime: .mlx,
+            lowMemoryEnabled: true,
+            hasIncreasedMemoryEntitlement: false
+        )
+
+        XCTAssertTrue(message.contains("missing the iOS Increased Memory Limit entitlement"))
+        XCTAssertTrue(message.contains("provisioning profile"))
+        XCTAssertTrue(MemoryAdvisor.isHardCapacityFailure(message))
+    }
+
     func test_transientLoadFailureRemainsRetryable() {
         XCTAssertFalse(
             MemoryAdvisor.isHardCapacityFailure(
                 "Not enough memory right now. Close other apps, then retry."
+            )
+        )
+    }
+
+    func test_entitledNearFitAllowsReserveOnlyDeficit() {
+        XCTAssertTrue(
+            MemoryAdvisor.entitledNearFitAllowed(
+                neededBytes: 9_200_000_000,
+                availableBytes: 9_120_000_000,
+                measuredPeakBytes: 8_700_000_000,
+                runtime: .mlx,
+                hasEntitlement: true,
+                peakIsCalibrated: true
+            )
+        )
+    }
+
+    func test_build116GemmaEstimateCannotBypassStrictVerdict() {
+        // Exact envelope exported by the affected iPhone18,2. Build 116 treated
+        // weights × 1.3 as a measured peak, admitted the model, and iOS killed
+        // the app twice during loading-local-weights before MLX reported any
+        // allocation. An uncalibrated estimate must not unlock near-fit.
+        XCTAssertTrue(
+            MemoryAdvisor.strictVerdictBlocks(
+                neededBytes: 9_210_000_000,
+                availableBytes: 9_150_000_000,
+                measuredPeakBytes: 8_710_000_000,
+                allowTightFit: false,
+                runtime: .mlx,
+                hasEntitlement: true,
+                peakIsCalibrated: false
+            )
+        )
+        XCTAssertTrue(
+            MemoryAdvisor.strictVerdictBlocks(
+                neededBytes: 9_210_000_000,
+                availableBytes: 9_150_000_000,
+                measuredPeakBytes: 8_710_000_000,
+                allowTightFit: true,
+                runtime: .mlx,
+                hasEntitlement: true,
+                peakIsCalibrated: false
+            ),
+            "MLX low-memory mode cannot page weights and must not bypass an uncalibrated load reserve"
+        )
+    }
+
+    func test_strictVerdictStillBlocksUnsafeOrUnentitledNearFits() {
+        XCTAssertTrue(
+            MemoryAdvisor.strictVerdictBlocks(
+                neededBytes: 9_210_000_000,
+                availableBytes: 9_150_000_000,
+                measuredPeakBytes: 9_170_000_000,
+                allowTightFit: false,
+                runtime: .mlx,
+                hasEntitlement: true,
+                peakIsCalibrated: true
+            ),
+            "A peak above live memory must remain blocked"
+        )
+        XCTAssertTrue(
+            MemoryAdvisor.strictVerdictBlocks(
+                neededBytes: 9_210_000_000,
+                availableBytes: 9_150_000_000,
+                measuredPeakBytes: 8_710_000_000,
+                allowTightFit: false,
+                runtime: .mlx,
+                hasEntitlement: false,
+                peakIsCalibrated: true
+            ),
+            "The reserve override requires the entitlement"
+        )
+    }
+
+    func test_nearFitNeverAllowsPeakOrNonMLXToExceedAvailableMemory() {
+        XCTAssertFalse(
+            MemoryAdvisor.entitledNearFitAllowed(
+                neededBytes: 9_200_000_000,
+                availableBytes: 9_120_000_000,
+                measuredPeakBytes: 9_150_000_000,
+                runtime: .mlx,
+                hasEntitlement: true,
+                peakIsCalibrated: true
+            )
+        )
+        XCTAssertFalse(
+            MemoryAdvisor.entitledNearFitAllowed(
+                neededBytes: 9_200_000_000,
+                availableBytes: 9_120_000_000,
+                measuredPeakBytes: 8_700_000_000,
+                runtime: .llamaCpp,
+                hasEntitlement: true,
+                peakIsCalibrated: true
             )
         )
     }
@@ -518,6 +702,25 @@ final class DeviceTierAdvisorTests: XCTestCase {
                 runtime: .mlx,
                 allowUnsafeMemoryLoad: true
             )
+        )
+    }
+
+    @MainActor
+    func test_measuredImportedFootprintCannotFallBackToUnknownModelFloor() {
+        let ceiling = MemoryAdvisor.processMemoryCeiling
+        guard ceiling > 0 else { return }
+
+        let blocker = MemoryAdvisor.safetyBlocker(
+            for: "imported:local/local_7-Qwopus3",
+            runtime: .mlx,
+            measuredFootprintBytes: ceiling + 1_000_000_000
+        )
+
+        XCTAssertNotNil(blocker)
+        let normalized = blocker?.lowercased() ?? ""
+        XCTAssertTrue(
+            normalized.contains("too large")
+                || normalized.contains("needs")
         )
     }
 
@@ -662,5 +865,22 @@ final class DeviceTierAdvisorTests: XCTestCase {
             policy.minimumAvailableBytes,
             GGUFLoadPolicy.storageBackedHeadroom
         )
+    }
+
+    func test_normalGGUFNearFitGraceRequiresEntitlement() {
+        let policy = GGUFLoadPolicy.resolve(
+            fileBytes: 7_505_194_272,
+            pagingEnabled: false
+        )
+        let available = policy.minimumAvailableBytes - 40_000_000
+
+        XCTAssertTrue(policy.canAdmit(
+            availableBytes: available,
+            hasIncreasedMemoryEntitlement: true
+        ))
+        XCTAssertFalse(policy.canAdmit(
+            availableBytes: available,
+            hasIncreasedMemoryEntitlement: false
+        ))
     }
 }

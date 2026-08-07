@@ -2892,13 +2892,6 @@ struct CodingAssistantView: View {
                     }
                     self.persistCurrentConversation()
                     HapticManager.analysisComplete()
-                    // Bump the meaningful-interaction counter on every
-                    // completed assistant turn. The eligibility check
-                    // (≥5 turns, ≥3 days installed, ≥30 days since last
-                    // prompt) lives inside the service — we just feed
-                    // it the signal and let it decide whether to fire.
-                    ReviewPromptService.shared.recordMeaningfulInteraction()
-                    ReviewPromptService.shared.evaluateAndMaybePrompt()
                 }
             }
         )
@@ -2968,8 +2961,6 @@ struct CodingAssistantView: View {
                     }
                     self.persistCurrentConversation()
                     HapticManager.analysisComplete()
-                    ReviewPromptService.shared.recordMeaningfulInteraction()
-                    ReviewPromptService.shared.evaluateAndMaybePrompt()
                 }
             }
         )
