@@ -1,0 +1,36 @@
+# Xcode
+xcuserdata/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Build artifacts
+.build/
+default.profraw
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+python/.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local settings
+.claude/settings.local.json
+
+# Local artifacts
+exports/
+*.jpeg

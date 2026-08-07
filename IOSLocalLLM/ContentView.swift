@@ -1,2114 +1,1464 @@
 import SwiftUI
-import PhotosUI
+import UIKit
 
-// MARK: - ContentView
+struct LocalAPIServerView: View {
+    @ObservedObject private var manager = LocalAPIManager.shared
+    @ObservedObject private var modelService = CodingAssistantService.shared
+    @ObservedObject private var systemStatus = SystemStatusService.shared
+    @ObservedObject private var safetyMonitor = DeviceSafetyMonitor.shared
+    @Environment(\.scenePhase) private var scenePhase
 
-struct ContentView: View {
-    // App opens on the Home dashboard. Assistant / Lens are one tap away.
-    @State private var selectedTab: Tab = .home
-    @StateObject private var bridge = AppBridge.shared
-    @ObservedObject private var settings = AppSettings.shared
-    @ObservedObject private var legal = LegalAcceptanceManager.shared
-    @ObservedObject private var loc = LocalizationService.shared
+    @AppStorage("localAPIEnabled") private var serverEnabled = true
+    @AppStorage("localAPIPort") private var port = 11_434
+    @AppStorage("localAPIKeepScreenAwake") private var keepScreenAwake = true
+    @AppStorage("localAPIAutoLoadModel") private var autoLoadModel = false
+    @AppStorage("localAPIToolCallingEnabled") private var toolCallingEnabled = true
+    @AppStorage("localAPIReasoningEnabled") private var reasoningEnabled = false
+    @AppStorage("localAPIParallelToolCallsLimit") private var parallelToolCallsLimit = 2
+    @AppStorage("localAPIStrictToolSchemasEnabled") private var strictToolSchemasEnabled = true
 
-    @StateObject private var camera: CameraService
-    @StateObject private var analysis: AnalysisService
-    @StateObject private var reviewPrompt = ReviewPromptService.shared
-
-    @State private var showSettings = false
-    // Mac/Bridge is reached from a Home button now (Models took its tab slot).
-    // Presented as a sheet. AppBridge.requestTab(.mac) (index 3) also opens it.
-    @State private var showMac = false
-    @State private var showImageGeneration = false
-    // Bottom tabs: Home · Assistant · Lens · Voice · Models.
-    enum Tab: CaseIterable, Hashable {
-        case home, assistant, camera, voice, models
-    }
-
-    init() {
-        let cam = CameraService()
-        _camera = StateObject(wrappedValue: cam)
-        _analysis = StateObject(wrappedValue: AnalysisService(camera: cam))
-    }
+    @State private var portText = "11434"
+    @State private var apiKeyVisible = false
+    @State private var copyMessage: String?
+    @State private var showingKeyRotationConfirmation = false
+    @State private var showingModelPicker = false
+    @State private var showingDownloads = false
+    @State private var lastLoggedModelState: CodingAssistantService.ServiceState?
 
     var body: some View {
-        // Native tab bar only — it renders Apple's Liquid Glass on iOS 26.
-        TabView(selection: $selectedTab) {
-            // Order: home → assistant → lens → voice → models. Home is the
-            // landing dashboard (on-device status, recents, gateway to Settings
-            // + Mac). Assistant and Lens are the two most-used surfaces. Voice
-            // keeps hands-free conversation first-class. Models (the management
-            // hub) sits at the right edge; Mac/Bridge moved to a Home button.
-            homeTab
-                .tag(Tab.home)
-                .tabItem { Label("Home", systemImage: "house") }
+        NavigationStack {
+            ZStack {
+                LASPageBackground()
 
-            assistantTab
-                .tag(Tab.assistant)
-                .tabItem { Label("Assistant", systemImage: "brain") }
+                VStack(spacing: 0) {
+                    LASHomeHeader()
 
-            cameraTab
-                .tag(Tab.camera)
-                .tabItem { Label("Lens", systemImage: "camera.viewfinder") }
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                        LASNetworkBanner(
+                            state: manager.state,
+                            modelState: modelService.state,
+                            address: manager.addresses.first,
+                            port: port
+                        )
 
-            VoiceLibraryView(isActive: selectedTab == .voice)
-                .tag(Tab.voice)
-                .tabItem { Label("Voice", systemImage: "waveform") }
+                        LASHealthDashboard(
+                            snapshot: systemStatus.snapshot,
+                            thermalState: safetyMonitor.effectiveThermalState,
+                            lowPowerMode: safetyMonitor.lowPowerMode
+                        )
 
-            ModelsManagerView(isActive: selectedTab == .models)
-                .tag(Tab.models)
-                .tabItem { Label("Models", systemImage: "cube.box") }
-        }
-        .tint(T.accent)
-        // Re-probe every model's on-disk state whenever the user lands on
-        // either tab. Catches the common case where a download finished while
-        // the user was on the other tab — without this, the card kept showing
-        // "Download" until you tapped it again to nudge the state machine.
-        //
-        // Also: unload the OTHER tab's model. The assistant LLM (~2.3 GB)
-        // and the lens VLM (~1 GB) together with camera buffers + KV cache
-        // exceeded iOS's 6 GB high-watermark and got Jetsam-killed
-        // (EXC_RESOURCE on real iPhones). Keep only the active tab's model
-        // resident; the inactive one re-loads from its cached weights on
-        // demand. Cost of an unload+reload is ~1–2 seconds; cost of a
-        // Jetsam kill is "the app dies", so the trade is obvious.
-        .onChange(of: selectedTab) { oldTab, newTab in
-            updateToastLane(for: newTab)
-            // Tactile feedback on every tab change. iOS 18+ tab bar has
-            // its own subtle system haptic; this layers our brand selection
-            // tap on top so it feels consistent with the rest of the app's
-            // haptic vocabulary (capture, send, success). The programmatic
-            // bridge-driven path below also fires HapticManager.tabSwitch();
-            // a double-fire is benign — the generators dedupe at the
-            // Core Haptics layer when triggered within a few ms.
-            HapticManager.tabSwitch()
-            ModelDownloadCenter.shared.refreshAllStates()
+                        LASLocalServerParserCard(
+                            serverState: manager.state,
+                            modelState: modelService.state,
+                            modelName: modelService.activeDisplayName,
+                            tokenRate: modelService.tokenRate
+                        )
 
-            // Tab-leave cleanup. iOS 18+ `TabView` does NOT reliably fire
-            // `.onDisappear` on tab swap (the view stays alive in memory),
-            // so the previous version's reliance on `VoiceConversationView`'s
-            // `.onDisappear { conv.stop() }` and `CameraRootView`'s
-            // `LensVoiceNarrator.deactivate()` both leaked work after
-            // the user navigated away — mic stayed hot, TTS kept
-            // playing, lens narration kept consuming hooks. The
-            // selectedTab change is the canonical signal — drive
-            // cleanup from here.
-            switch oldTab {
-            case .voice:
-                VoiceConversationService.shared.stop()
-            case .camera:
-                LensVoiceNarrator.shared.deactivate()
-                // Stop the capture session — it otherwise keeps the sensor
-                // + ISP running (and draining battery / making heat) behind
-                // every other tab. `start()`/`stop()` are idempotent.
-                camera.stop()
-            case .assistant, .home, .models:
-                break
-            }
-            // Keep one inference runtime resident at a time. A static weight
-            // estimate cannot account for camera buffers, KV cache, allocator
-            // pooling, or Metal commands still finishing after cancellation.
-            // Every backend's load path also performs an awaitable drain, so a
-            // very fast tab/model change remains safe even though this SwiftUI
-            // callback itself is synchronous.
-            let sharedRepo = AssistantModelCatalog.currentSelection().repoID
-            let preserveSharedDualRole = DualRoleModelPolicy.selectionsMatch(repoID: sharedRepo)
-                && LensInferenceLoop.shared.sharedContainer(for: sharedRepo) != nil
-            switch newTab {
-            case .camera:
-                // Headed to the Lens — always drop the Assistant LLM.
-                CodingAssistantService.shared.unload()
-                // Resume the capture session stopped on tab-leave above.
-                // Safe on first entry too: start() guards on isRunning,
-                // and CameraRootView's `.task { analysis.start() }` path
-                // configures the session and calls start() itself (a
-                // no-op once we're already running).
-                camera.start()
-            case .assistant:
-                // Headed to chat — drop the camera VLM + FastVLM
-                // unless both can coexist. FastVLM is unrelated to
-                // the LLM/VLM coexistence question (separate small
-                // service), but it's lightweight enough that we
-                // unload it unconditionally to avoid double-counting.
-                // Both VLM backends (MLX + llama.cpp) get the same
-                // treatment — only one is ever resident at a time
-                // anyway (the routing in AnalysisService picks one
-                // per active repo).
-                if !preserveSharedDualRole {
-                    MLXVisionService.shared.unload()
-                }
-                LlamaCppVLMService.shared.unload()
-                FastVLMService.shared.unload()
-            case .voice:
-                // Voice mode runs the LLM (for replies) but never the
-                // VLM stack. Drop the vision services so Whisper + the
-                // assistant LLM + TTS audio buffers have headroom.
-                MLXVisionService.shared.unload()
-                LlamaCppVLMService.shared.unload()
-                FastVLMService.shared.unload()
-            case .models:
-                // Keep the assistant LLM resident so returning to chat is
-                // instant — model "activating" was slow when visiting Models
-                // unloaded it. Only the vision stack is dropped (downloads still
-                // get the camera VLM's headroom, and MemoryPressureCoordinator
-                // sheds the LLM if RAM gets tight).
-                if !preserveSharedDualRole {
-                    MLXVisionService.shared.unload()
-                }
-                LlamaCppVLMService.shared.unload()
-                FastVLMService.shared.unload()
-            case .home:
-                // Home shows the assistant's live readiness — keep the LLM
-                // resident so the hero reflects a real "ready" and New chat is
-                // instant. Only the vision stack (camera/VLM) is dropped here;
-                // Lens reloads it on demand, and switching to Lens/Voice still
-                // unloads the LLM when both models can't coexist.
-                if !preserveSharedDualRole {
-                    MLXVisionService.shared.unload()
-                }
-                LlamaCppVLMService.shared.unload()
-                FastVLMService.shared.unload()
-            }
-        }
-        // Same idea for cold-launch + foreground resumes.
-        .onReceive(NotificationCenter.default.publisher(
-            for: UIApplication.willEnterForegroundNotification)
-        ) { _ in
-            ModelDownloadCenter.shared.refreshAllStates()
-        }
-        .onAppear {
-            updateToastLane(for: selectedTab)
-            // Setup ordering matters here.
-            //
-            // 1. DeviceTierAdvisor.apply*IfNeeded MUST run synchronously on
-            //    .onAppear because they set cameraVisualModelID and
-            //    assistantModelID — the user can tap capture (or send a
-            //    message) within a few hundred ms of launch and those
-            //    settings must already reflect the right defaults, or the
-            //    capture path falls into the no-model branch and nothing
-            //    streams. They're cheap (settings + a couple of
-            //    ModelCacheProbe walks that short-circuit on the first
-            //    config + weights file found).
-            //
-            // 2. BundledVLMInstaller.installIfNeeded() is the actually
-            //    expensive piece on a fresh install — it copies ~1 GB of
-            //    bundled SmolVLM2 weights into the HubApi cache. Even
-            //    `isInstalled` does a fileExists on a multi-level path.
-            //    Move only this off the main thread to keep launch snappy.
-            //
-            // 3. ModelDownloadCenter.refreshAllStates() iterates the full
-            //    catalog and does a fileExists check per model — fast,
-            //    but bundled with the installer for symmetry.
-            DeviceTierAdvisor.applyDefaultIfNeeded()
-            DeviceTierAdvisor.applyDefaultVisualModelIfNeeded()
-            // Begin watching the kernel memory-pressure signal: dump model
-            // weights on .critical (imminent Jetsam) and shed them when
-            // backgrounded with low headroom. Idempotent.
-            MemoryPressureCoordinator.shared.start()
-            Task.detached(priority: .userInitiated) {
-                BundledVLMInstaller.installIfNeeded()
-                await MainActor.run {
-                    ModelDownloadCenter.shared.refreshAllStates()
+#if CORE_AI_SERVER_APP
+                        CoreAIModelStatusCard()
+#endif
+
+                        LASHomeServerCard(
+                            state: manager.state,
+                            serverEnabled: $serverEnabled,
+                            keepScreenAwake: $keepScreenAwake,
+                            autoLoadModel: $autoLoadModel,
+                            toolCallingEnabled: $toolCallingEnabled,
+                            reasoningEnabled: $reasoningEnabled,
+                            parallelToolCallsLimit: $parallelToolCallsLimit,
+                            strictToolSchemasEnabled: $strictToolSchemasEnabled,
+                            portText: $portText,
+                            modelName: modelService.activeDisplayName,
+                            modelID: modelService.activeModel.id,
+                            repoID: modelService.activeModel.repoID,
+                            capabilityProfile: ModelCapabilityProfile.resolve(
+                                for: modelService.activeModel
+                            ),
+                            modelState: modelService.state,
+                            addresses: manager.addresses,
+                            port: port,
+                            apiKey: manager.apiKey,
+                            apiKeyVisible: $apiKeyVisible,
+                            copyMessage: copyMessage,
+                            onRestart: restartServer,
+                            onApplyPort: applyPort,
+                            onLoadModel: loadModel,
+                            onChooseModel: { showingModelPicker = true },
+                            onStopModel: modelService.unload,
+                            onCopyURL: copyURL,
+                            onCopyKey: copyKey,
+                            onRotateKey: { showingKeyRotationConfirmation = true },
+                            onCopySetup: copySetupCommands
+                        )
+
+                        LASDeveloperEndpointsCard(
+                            address: manager.addresses.first,
+                            port: port,
+                            onCopyURL: copyURL
+                        )
+                    }
+                        .padding(.horizontal, LASDesignTokens.pageInset)
+                        .padding(.top, 12)
+                        .padding(.bottom, 28)
+                    }
+                    .scrollIndicators(.hidden)
                 }
             }
-            // A Siri/Shortcuts App Intent can set `requestedTab` before this
-            // view mounts on a cold launch — `.onChange` won't fire for a
-            // value already present at first render, so apply it here too.
-            if bridge.requestedTab != nil { applyRequestedTab(bridge.requestedTab) }
-            // Seed the Spotlight index with existing chats on launch (the
-            // per-save reindex in ConversationStore.persist keeps it fresh
-            // thereafter).
-            SpotlightIndexer.reindexAll(ConversationStore.shared.conversations)
-        }
-        // colorScheme is set by IOSLocalLLMApp root via AppSettings.appearance
-        // Switch tabs when the camera bridge requests it. Use a no-animation
-        // transaction so the previous tab's subtree is torn down before the
-        // new one mounts — a spring animation here used to keep both subtrees
-        // resident and bleed the assistant's cream T.bg onto the lens.
-        .onChange(of: bridge.requestedTab) { _, newTab in
-            applyRequestedTab(newTab)
-        }
-        // Settings sheet
-        .sheet(isPresented: $showSettings) {
-            SettingsView(assistant: CodingAssistantService.shared)
-                // FastVLM status is now observed live inside SettingsView via FastVLMService.shared
-        }
-        // Mac / Bridge sheet — reached from the Home "Mac" button (it's no
-        // longer a bottom tab). BridgePairingView owns its own NavigationStack;
-        // the drag indicator makes swipe-to-dismiss discoverable.
-        .sheet(isPresented: $showMac) {
-            BridgePairingView()
-                .presentationDragIndicator(.visible)
-        }
-        .sheet(isPresented: $showImageGeneration) {
-            ImageGenerationView()
-        }
-        // Legal acceptance is the FIRST gate — must accept before anything else.
-        // Gate on ANY outstanding acceptance (EULA version, AI disclaimer, or
-        // device-safety notice), not just the version, so each can re-prompt.
-        .fullScreenCover(isPresented: Binding(
-            get: { legal.needsAnyAcceptance },
-            set: { _ in }
-        )) {
-            LegalAcceptanceView { /* dismiss when accepted */ }
-        }
-        // Onboarding full-screen cover on first launch (after legal accepted)
-        .fullScreenCover(isPresented: Binding(
-            get: { !legal.needsAnyAcceptance && !settings.hasSeenOnboarding },
-            set: { if !$0 { settings.hasSeenOnboarding = true } }
-        )) {
-            OnboardingView()
-        }
-        // Rate-the-app pre-prompt — service decides when (≥5 turns,
-        // ≥3 days installed, ≥30 days cooldown). Mounted at the root so
-        // it surfaces regardless of which tab is active when the
-        // threshold is hit. Suppressed during onboarding/legal so we
-        // never stack sheets.
-        .sheet(isPresented: Binding(
-            get: { reviewPrompt.shouldShowPrompt
-                    && !legal.needsAnyAcceptance
-                    && settings.hasSeenOnboarding },
-            set: { newValue in
-                if !newValue { reviewPrompt.userDeferred() }
+            .toolbar(.hidden, for: .navigationBar)
+            .navigationDestination(isPresented: $showingDownloads) {
+                LASModelDownloadsView()
             }
-        )) {
-            ReviewPromptSheet()
+            .task {
+                portText = String(port)
+                systemStatus.startObserving()
+                if serverEnabled {
+                    await manager.start()
+                }
+                if autoLoadModel {
+                    loadModel()
+                }
+            }
+            .onChange(of: serverEnabled) { _, enabled in
+                Task {
+                    if enabled {
+                        await manager.start()
+                    } else {
+                        await manager.stop()
+                    }
+                }
+            }
+            .onChange(of: port) { _, newPort in
+                portText = String(newPort)
+            }
+            .onChange(of: keepScreenAwake) { _, _ in
+                manager.refreshIdleTimerPolicy()
+            }
+            .onChange(of: autoLoadModel) { _, enabled in
+                if enabled {
+                    loadModel()
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active {
+                    // Do not leave a bearer credential visible in the app
+                    // switcher snapshot or on a locked screen.
+                    apiKeyVisible = false
+                }
+            }
+            .onReceive(modelService.$state.removeDuplicates()) { state in
+                guard state != lastLoggedModelState else { return }
+                lastLoggedModelState = state
+                RuntimeLogCenter.shared.append(
+                    modelStateMessage(state),
+                    subsystem: "model"
+                )
+            }
+            .onDisappear {
+                apiKeyVisible = false
+                systemStatus.stopObserving()
+            }
+            .sheet(isPresented: $showingModelPicker) {
+                LASModelPickerView(
+                    currentModel: modelService.activeModel,
+                    onSelect: handleModelSelection,
+                    onOpenModels: {
+                        showingModelPicker = false
+                        showingDownloads = true
+                    }
+                )
+            }
+            .alert("Rotate API key?", isPresented: $showingKeyRotationConfirmation) {
+                Button("Rotate", role: .destructive) {
+                    manager.rotateKey()
+                    copyMessage = "New key generated"
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Existing clients will stop working until they use the new key.")
+            }
         }
     }
 
-    /// Applies a tab navigation request (from the camera bridge, share
-    /// extension, or a Siri/Shortcuts App Intent) and clears it. No-animation
-    /// transaction so the previous tab's subtree tears down before the new one
-    /// mounts — a spring here used to keep both resident and bleed the
-    /// assistant's cream background onto the lens.
-    private func applyRequestedTab(_ newTab: Int?) {
-        guard let tab = newTab else { return }
-        // 0 = camera, 1 = assistant, 2 = models, 3 = mac, 4 = voice.
-        // Mac is no longer a tab — index 3 presents the Mac sheet instead
-        // (keeps every existing `requestTab(.mac)` call site working).
-        if tab == 3 {
-            showMac = true
-            HapticManager.tabSwitch()
-            bridge.requestedTab = nil
+    private func restartServer() {
+        Task { await manager.restart() }
+    }
+
+    private func loadModel() {
+        if openDownloadsIfNeeded(for: modelService.activeModel) {
             return
         }
-        var t = Transaction()
-        t.disablesAnimations = true
-        withTransaction(t) {
-            switch tab {
-            case 1: selectedTab = .assistant
-            case 2: selectedTab = .models
-            case 4: selectedTab = .voice
-            default: selectedTab = .camera
-            }
+        modelService.startLoad()
+    }
+
+    private func handleModelSelection(_ model: AssistantModel) {
+        if openDownloadsIfNeeded(for: model) {
+            showingModelPicker = false
+            return
         }
-        HapticManager.tabSwitch()
-        bridge.requestedTab = nil
+
+        showingModelPicker = false
+        modelService.startSwitchTo(model)
     }
 
-    /// Keeps transient notifications below each tab's top chrome. Assistant's
-    /// two-line model picker is taller than a standard navigation row.
-    private func updateToastLane(for tab: Tab) {
-        switch tab {
-        case .assistant:
-            ToastCenter.shared.setTopPadding(96)
-        case .models:
-            ToastCenter.shared.setTopPadding(8)
-        case .home, .camera, .voice:
-            ToastCenter.shared.setTopPadding(52)
+    private func openDownloadsIfNeeded(for model: AssistantModel) -> Bool {
+        let center = ModelDownloadCenter.shared
+        center.refreshAllStates()
+
+        guard let downloadable = center.models.first(where: {
+            $0.id == model.id || $0.sourceRepoID == model.repoID
+        }), !downloadable.isReady else {
+            return false
+        }
+
+        // A cold selection needs the download surface so the user can see
+        // resumable file progress while the model is fetched. The local
+        // server parser stays on Home because it represents runtime activity,
+        // not file-transfer progress.
+        downloadable.start()
+        showingDownloads = true
+        return true
+    }
+
+    private func applyPort() {
+        let normalized = portText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let candidate = Int(normalized),
+              LocalAPIValidation.validPort(candidate) != nil else {
+            copyMessage = "Port must be 1024–65535"
+            return
+        }
+        port = candidate
+        copyMessage = "Port saved"
+        guard serverEnabled else { return }
+        Task { await manager.restart() }
+    }
+
+    private func copyURL(_ value: String) {
+        UIPasteboard.general.string = value
+        copyMessage = "URL copied"
+    }
+
+    private func copyKey() {
+        UIPasteboard.general.string = manager.apiKey
+        copyMessage = "API key copied"
+    }
+
+    private func copySetupCommands() {
+        let base = manager.addresses.first.map { "http://\($0):\(port)" } ?? "http://<DEVICE_IP>:\(port)"
+        UIPasteboard.general.string = """
+        export OPENAI_BASE_URL=\(base)/v1
+        export OPENAI_API_KEY=\(manager.apiKey)
+        curl "$OPENAI_BASE_URL/models" -H "Authorization: Bearer $OPENAI_API_KEY"
+        """
+        copyMessage = "Setup commands copied with API key"
+    }
+
+    private func modelStateMessage(_ state: CodingAssistantService.ServiceState) -> String {
+        switch state {
+        case .unloaded:
+            return "Model unloaded"
+        case .loading(let message):
+            return "Model loading: \(message)"
+        case .ready:
+            return "Model ready: \(modelService.activeDisplayName)"
+        case .generating:
+            return "Model serving an API request"
+        case .failed(let message):
+            return "Model failed: \(message)"
         }
     }
-
-    // MARK: - Tabs
-
-    private var cameraTab: some View {
-        CameraRootView(camera: camera, analysis: analysis,
-                       onShowSettings: { showSettings = true },
-                       onClose: { selectedTab = .home },
-                       isLensActive: selectedTab == .camera)
-            // Camera is always dark and uses the app-wide black accent. Upgrade
-            // the background to true black when the user picked OLED.
-            .koduTheme(KoduTheme.make(
-                appearance: settings.appearance == "oled" ? "oled" : "dark",
-                accent: KoduTheme.appAccent))
-            .preferredColorScheme(.dark)
-    }
-
-    private var assistantTab: some View {
-        CodingAssistantView(
-            isActive: selectedTab == .assistant,
-            onClose: { selectedTab = .home }
-        )
-    }
-
-    private var homeTab: some View {
-        HomeView(
-            onNewChat: { AppBridge.shared.startNewChat() },
-            onOpenLens: { selectedTab = .camera },
-            onOpenVoice: { selectedTab = .voice },
-            onOpenModels: { selectedTab = .models },
-            onOpenMac: { showMac = true },
-            onGenerateImage: { showImageGeneration = true },
-            onOpenSettings: { showSettings = true },
-            onOpenConversation: { AppBridge.shared.openConversation(id: $0.id) }
-        )
-    }
-
-    @Environment(\.koduTheme) private var T
 }
 
-// MARK: - CameraRootView
+private struct LASHomeHeader: View {
+    var body: some View {
+        HStack(spacing: LASDesignTokens.row) {
+            Text("On Device : LAS")
+                .font(.title3.weight(.bold))
+                .lineLimit(1)
 
-struct CameraRootView: View {
-    @ObservedObject var camera: CameraService
-    @ObservedObject var analysis: AnalysisService
-    let onShowSettings: () -> Void
-    /// Closes the Lens (returns to Home) — wired to the design-03 top-left ×.
-    var onClose: () -> Void = {}
-    /// True only while the Lens is the selected tab. Threaded in from
-    /// ContentView (`selectedTab == .camera`) because iOS 18 `TabView` does
-    /// NOT reliably fire `.onDisappear` on a tab swap — so the live-caption
-    /// loop and its `lens-live-loop` keep-awake reason must be torn down off
-    /// this reliable signal, not `.onDisappear`, or they leak past tab leave.
-    var isLensActive: Bool = true
-    /// Gallery import selection for the shutter-row photo button.
-    @State private var photoItem: PhotosPickerItem?
+            Spacer(minLength: LASDesignTokens.tight)
 
-    @ObservedObject private var settings = AppSettings.shared
-    @ObservedObject private var bridge = AppBridge.shared
-    @ObservedObject private var loc = LocalizationService.shared
-    @ObservedObject private var liveOCR = LiveOCRService.shared
-    // Intentionally NOT observing MLXVisionService here. Its `state` ticks
-    // 10–20× per second during a model download (each HubApi progress
-    // callback publishes a new value). Every tick re-rendered the whole
-    // CameraRootView, which in turn caused AVCaptureVideoPreviewLayer to
-    // briefly render at a partial-laid-out size — the centred translucent
-    // strip the user kept circling. The `activeVLMReady` computed
-    // property below reads `.shared.state` lazily; the HUD pill won't
-    // animate to green the instant the model is ready, but any other
-    // state change (fps tick, detection update) refreshes it shortly
-    // after — well worth the trade for a strip-free lens tab.
+            HStack(spacing: 0) {
+                NavigationLink {
+                    LASThemeSettingsView()
+                } label: {
+                    Image(systemName: "paintpalette")
+                        .font(.system(size: 18, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Theme")
 
-    @State private var showAnalysisPanel = false
-    @State private var panelDetent: PresentationDetent = .fraction(0.55)
-    @State private var captureButtonScale: CGFloat = 1.0
-    @State private var showHistory = false
-    @State private var showDownloadCenter = false
-    @State private var showDocumentScanner = false
-    @State private var showVisualModelPicker = false
-    @State private var didCopyCaption = false
-    @State private var presetPickerSheet = false
-    /// Redesigned Code Mode: tap-to-capture still → faithful OCR → code LLM.
-    /// Owns its own flow independent of the VLM-based AnalysisService.
-    @StateObject private var codeMode = CodeModeController()
-    @State private var showCodeMode = false
-    @State private var isCapturingStill = false
-    /// Last non-empty caption — kept across capture cycles so the pill
-    /// doesn't flicker to empty between auto-refreshes.
-    @State private var lastCaption: String = ""
-    /// Gate for the live-caption follow-up burst. False until the user has
-    /// explicitly tapped capture once this session. Without it the burst
-    /// fires the moment the lens tab is opened in visual mode, racing
-    /// AVFoundation's first frame and MLX's lazy model load — the most
-    /// common path to the Metal command-buffer SIGABRT users keep
-    /// hitting on cold launch. Tap-to-start makes the lens tab itself
-    /// always safe; the model only runs when the user asks for it.
-    @State private var hasStartedLiveLoop: Bool = false
-    @State private var lensPanelState: LensPanelState = .collapsed
-    @State private var selectedLensMode: LensMode = .ask
-    @FocusState private var lensPromptFocused: Bool
-    @Environment(\.koduTheme) private var T
+                LASHomeHeaderDivider()
 
-    private static let liveCaptionFollowUpLimit = 2
-    private static let minimumLiveCaptionIntervalMS = 6_000
-    private static let maximumLiveCaptionIntervalMS = 30_000
+                NavigationLink {
+                    LASModelDownloadsView()
+                } label: {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.system(size: 18, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Model downloads")
 
-    private var activeMode: AnalysisMode {
-        AnalysisMode(rawValue: settings.analysisMode) ?? .code
+                LASHomeHeaderDivider()
+
+                NavigationLink {
+                    LASOnDeviceDebuggerView()
+                } label: {
+                    Image(systemName: "ladybug")
+                        .font(.system(size: 18, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("On-device debugger")
+
+                LASHomeHeaderDivider()
+
+                NavigationLink {
+                    LASTerminalView()
+                } label: {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 18, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Verbose terminal")
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 4)
+            .glassSurface(.capsule)
+            .overlay {
+                Capsule().stroke(LASDesignTokens.hairline, lineWidth: 1)
+            }
+        }
+        .padding(.horizontal, LASDesignTokens.pageInset)
+        .frame(minHeight: 64)
+        .background(.ultraThinMaterial.opacity(0.55))
+    }
+}
+
+private struct LASHomeHeaderDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(LASDesignTokens.hairline)
+            .frame(width: 1, height: 20)
+    }
+}
+
+private struct LASHealthDashboard: View {
+    let snapshot: SystemStatusService.Snapshot
+    let thermalState: ProcessInfo.ThermalState
+    let lowPowerMode: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: LASDesignTokens.row) {
+            LASSectionLabel(
+                title: "DEVICE HEALTH",
+                trailing: lowPowerMode ? "LOW POWER" : thermalLabel.uppercased()
+            )
+
+            HStack(spacing: 0) {
+                LASCompactHealthMetric(
+                    title: "Thermal",
+                    value: thermalLabel,
+                    symbol: "thermometer.medium"
+                )
+                LASCompactHealthDivider()
+                LASCompactHealthMetric(
+                    title: "Available",
+                    value: MemoryAdvisor.availableRAM.formattedBytes,
+                    symbol: "memorychip"
+                )
+                LASCompactHealthDivider()
+                LASCompactHealthMetric(
+                    title: "Headroom",
+                    value: snapshot.availableForML.formattedBytes,
+                    symbol: "gauge.with.dots.needle.67percent"
+                )
+            }
+            .padding(.vertical, LASDesignTokens.tight)
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 18))
+
+            HStack(spacing: LASDesignTokens.component) {
+                Label("App \(snapshot.usedByApp.formattedBytes)", systemImage: "chart.bar.fill")
+                Spacer(minLength: 4)
+                Label("Free \(snapshot.diskFree.formattedBytes)", systemImage: "internaldrive")
+            }
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+        }
+        .lasCard(radius: LASDesignTokens.cardRadius, padding: LASDesignTokens.component)
+        .accessibilityElement(children: .contain)
     }
 
-    /// Short label for the HUD's VLM pill — switches from "fastvlm" to the
-    /// downloaded model's short name as soon as the user picks a non-default
-    /// VLM in VisualModelPickerView. Previously the pill was hard-coded to
-    /// "vlm" and always read FastVLM state, so picking SmolVLM gave no
-    /// visible confirmation that the routing had changed.
-    ///
-    /// FastVLM honesty: when the user is on the default (FastVLM) route but
-    /// the decoder/projector/tokenizer aren't actually ready — only the
-    /// encoder is — the pill reads "fastvlm·enc" instead of "fastvlm", so
-    /// users don't think the full visual-language pipeline is online.
-    private var activeVLMLabel: String {
-        let selectionID = LocalModelRegistry.storedVisionSelectionID(settings.cameraVisualModelID)
-        if LocalModelRegistry.isDefaultVisionSelection(selectionID) {
-            let s = analysis.fastVLMStatus
-            // Encoder up, but the decoder side isn't — be honest about it.
-            if s.encoder.isReady && !s.canGenerate { return "fastvlm·enc" }
-            return "fastvlm"
+    private var thermalLabel: String {
+        switch thermalState {
+        case .nominal: return "Nominal"
+        case .fair: return "Fair"
+        case .serious: return "Warm"
+        case .critical: return "Critical"
+        @unknown default: return "Unknown"
         }
-        let lastComponent = selectionID.split(separator: "/").last.map(String.init) ?? selectionID
-        return lastComponent
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "")
-            .replacingOccurrences(of: "_", with: "")
-            .prefix(12)
-            .description
     }
 
-    /// Ready state for whichever VLM `activeVLMLabel` represents. Reads
-    /// MLXVisionService.shared lazily (NOT observed — see the comment on
-    /// the `mlxVision` property removal above).
-    ///
-    /// For FastVLM, "ready" means the full pipeline can generate — not
-    /// merely that the encoder loaded. With an encoder-only build the HUD
-    /// pill stays dim, signalling that visual descriptions won't actually
-    /// stream until the rest of the pipeline lands.
-    private var activeVLMReady: Bool {
-        if LocalModelRegistry.isDefaultVisionSelection(
-            LocalModelRegistry.storedVisionSelectionID(settings.cameraVisualModelID)
-        ) {
-            return analysis.fastVLMStatus.canGenerate
+}
+
+private struct LASCompactHealthMetric: View {
+    let title: String
+    let value: String
+    let symbol: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(title, systemImage: symbol)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+            Text(verbatim: value)
+                .font(.caption.weight(.semibold).monospaced())
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
         }
-        if case .ready = MLXVisionService.shared.state { return true }
+        .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
+        .padding(.horizontal, LASDesignTokens.tight)
+    }
+}
+
+private struct LASCompactHealthDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(LASDesignTokens.hairline)
+            .frame(width: 1, height: 38)
+    }
+}
+
+/// A single parser for the model that serves the local API. Download rows have
+/// their own file-progress dots; this card deliberately reflects runtime work
+/// instead: loading, waiting for a request, or generating a response.
+private struct LASLocalServerParserCard: View {
+    let serverState: LocalAPIManager.State
+    let modelState: CodingAssistantService.ServiceState
+    let modelName: String
+    let tokenRate: Double
+
+    var body: some View {
+        let activity = LASLocalServerActivity(
+            serverState: serverState,
+            modelState: modelState
+        )
+        LiveParserBar(
+            isGenerating: activity == .generating,
+            status: activity.parserStatus,
+            badge: activity.badgeLabel,
+            tokenRate: tokenRate
+        )
+        .accessibilityHint(activity.detail(modelName: modelName))
+    }
+}
+
+private enum LASLocalServerActivity: Equatable {
+    case offline
+    case connecting
+    case listening
+    case ready
+    case preparing
+    case generating
+    case issue
+
+    init(
+        serverState: LocalAPIManager.State,
+        modelState: CodingAssistantService.ServiceState
+    ) {
+        switch serverState {
+        case .failed:
+            self = .issue
+        case .starting:
+            self = .connecting
+        case .stopped:
+            self = .offline
+        case .running:
+            switch modelState {
+            case .generating: self = .generating
+            case .loading: self = .preparing
+            case .failed: self = .issue
+            case .unloaded: self = .listening
+            case .ready: self = .ready
+            }
+        }
+    }
+
+    var parserStatus: String {
+        switch self {
+        case .offline: return "Offline"
+        case .connecting: return "Connecting"
+        case .listening: return "Listening"
+        case .ready: return "Ready"
+        case .preparing: return "Preparing"
+        case .generating: return "Parsing"
+        case .issue: return "Attention"
+        }
+    }
+
+    var badgeLabel: String {
+        switch self {
+        case .offline: return "OFFLINE"
+        case .connecting: return "STARTING"
+        case .listening: return "NO MODEL"
+        case .ready: return "READY"
+        case .preparing: return "LOADING"
+        case .generating: return "ACTIVE"
+        case .issue: return "ISSUE"
+        }
+    }
+
+    func detail(modelName: String) -> String {
+        switch self {
+        case .offline:
+            return "Start the local server to accept requests"
+        case .connecting:
+            return "Opening local endpoint"
+        case .listening:
+            return "Load a model to serve requests"
+        case .ready:
+            return "Waiting for local requests"
+        case .preparing:
+            return "Loading selected model"
+        case .generating:
+            return "Streaming local response"
+        case .issue:
+            return "Open the debugger for details"
+        }
+    }
+}
+private struct LASNetworkBanner: View {
+    let state: LocalAPIManager.State
+    let modelState: CodingAssistantService.ServiceState
+    let address: String?
+    let port: Int
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 10, height: 10)
+            Text(verbatim: endpointText)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+                .allowsTightening(true)
+            Spacer(minLength: 4)
+            Image(systemName: "network")
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+        .glassSurface(.card, cornerRadius: 17)
+        .overlay {
+            RoundedRectangle(cornerRadius: 17, style: .continuous)
+                .stroke(LASDesignTokens.hairline, lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var endpointText: String {
+        address.map { "Local API server · \($0):" + String(port) }
+            ?? "Local API server · waiting for LAN"
+    }
+
+    private var statusColor: Color {
+        switch state {
+        case .running:
+            switch modelState {
+            case .ready, .generating: return .green
+            case .loading: return .blue
+            case .unloaded: return .orange
+            case .failed: return .red
+            }
+        case .starting: return .blue
+        case .failed: return .red
+        case .stopped: return .gray
+        }
+    }
+}
+
+private struct LASModelCapabilitySection: View {
+    let profile: ModelCapabilityProfile
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            LASSectionLabel(title: "MODEL PROFILE")
+
+            valueRow("Family", profile.family.displayName)
+            valueRow("Context length", profile.configuredContextLength.formatted() + " tokens")
+            valueRow("KV-cache capacity", profile.maximumKVCacheTokens.formatted() + " tokens")
+            valueRow("Maximum output", profile.maximumOutputTokens.formatted() + " tokens")
+            valueRow("Estimated full KV", profile.estimatedKVCacheBytes.formattedBytes)
+            valueRow("Tool parser", profile.toolParser.displayName)
+            valueRow("Reasoning parser", profile.reasoningParser.displayName)
+            valueRow("Conversation memory", "Automatic at 72%")
+
+            if let warning = profile.hermesWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(LASDesignTokens.component)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func valueRow(_ label: String, _ value: String) -> some View {
+        LabeledContent(label) {
+            Text(value)
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+}
+
+private struct LASHomeServerCard: View {
+    let state: LocalAPIManager.State
+    @Binding var serverEnabled: Bool
+    @Binding var keepScreenAwake: Bool
+    @Binding var autoLoadModel: Bool
+    @Binding var toolCallingEnabled: Bool
+    @Binding var reasoningEnabled: Bool
+    @Binding var parallelToolCallsLimit: Int
+    @Binding var strictToolSchemasEnabled: Bool
+    @Binding var portText: String
+
+    let modelName: String
+    let modelID: String
+    let repoID: String
+    let capabilityProfile: ModelCapabilityProfile
+    let modelState: CodingAssistantService.ServiceState
+    let addresses: [String]
+    let port: Int
+    let apiKey: String
+    @Binding var apiKeyVisible: Bool
+    let copyMessage: String?
+    let onRestart: () -> Void
+    let onApplyPort: () -> Void
+    let onLoadModel: () -> Void
+    let onChooseModel: () -> Void
+    let onStopModel: () -> Void
+    let onCopyURL: (String) -> Void
+    let onCopyKey: () -> Void
+    let onRotateKey: () -> Void
+    let onCopySetup: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: LASDesignTokens.component) {
+            VStack(alignment: .leading, spacing: LASDesignTokens.component) {
+                intro
+                LASCardDivider()
+                serverControls
+            }
+            .lasCard(radius: LASDesignTokens.majorRadius)
+
+            modelSection
+                .lasCard()
+
+            LASModelCapabilitySection(profile: capabilityProfile)
+                .lasCard()
+
+            settingsSection
+                .lasCard()
+
+            connectionSection
+                .lasCard()
+
+            VStack(alignment: .leading, spacing: LASDesignTokens.section) {
+                apiKeySection
+                LASCardDivider()
+                quickStartSection
+                LASCardDivider()
+                securityNote
+            }
+            .lasCard()
+        }
+    }
+
+    private var intro: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: "globe.americas.fill")
+                .font(.system(size: 30))
+                .foregroundStyle(.primary)
+                .frame(width: 42)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Local API Server")
+                    .font(.title3.weight(.bold))
+                Text("OpenAI + Anthropic + Ollama · local network only")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var serverControls: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Enable Local API Server")
+                    .font(.headline)
+                Spacer()
+                Toggle("Enable Local API Server", isOn: $serverEnabled)
+                    .labelsHidden()
+                    .tint(.black)
+                    .accessibilityLabel("Enable Local API Server")
+            }
+
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 10, height: 10)
+                Text(statusText)
+                    .font(.system(.subheadline, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Restart", systemImage: "arrow.clockwise", action: onRestart)
+                    .buttonStyle(LASSecondaryButtonStyle())
+                    .disabled(!serverEnabled)
+            }
+        }
+    }
+
+    private var modelSection: some View {
+        VStack(alignment: .leading, spacing: LASDesignTokens.component) {
+            LASSectionLabel(
+                title: "MODEL RUNTIME",
+                trailing: modelStatusLabel,
+                trailingColor: modelStatusColor
+            )
+
+            HStack(alignment: .center, spacing: LASDesignTokens.row) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color.primary.opacity(0.055))
+                    Image(systemName: modelStatusSymbol)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(modelStatusColor)
+                }
+                .frame(width: 52, height: 52)
+                .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(modelName)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(modelStateTitle)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(modelStatusColor)
+                        .lineLimit(2)
+                    Text(repoID)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 4)
+                Button {
+                    UIPasteboard.general.string = modelID
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                        .background(Color.primary.opacity(0.055), in: Circle())
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Copy model ID")
+            }
+
+            HStack(spacing: LASDesignTokens.tight) {
+                modelActionButton
+                chooseModelButton
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var modelActionButton: some View {
+        if isModelReady {
+            Button("Unload", systemImage: "eject", action: onStopModel)
+                .buttonStyle(LASModelSecondaryButtonStyle())
+                .accessibilityHint("Remove the selected model from memory")
+        } else if isModelLoading {
+            Button("Stop loading", systemImage: "xmark", action: onStopModel)
+                .buttonStyle(LASModelSecondaryButtonStyle(foreground: .orange))
+        } else {
+            Button("Load model", systemImage: "play.fill", action: onLoadModel)
+                .buttonStyle(LASModelPrimaryButtonStyle())
+        }
+    }
+
+    private var chooseModelButton: some View {
+        Button("Choose", systemImage: "arrow.triangle.2.circlepath", action: onChooseModel)
+            .buttonStyle(LASModelSecondaryButtonStyle())
+    }
+
+    private var parallelToolCallsExplanation: String {
+        guard toolCallingEnabled else {
+            return "Enable tool calling to use this setting."
+        }
+
+        let setting = LocalAPIParallelToolCallsSetting(rawValue: parallelToolCallsLimit)
+            ?? .automaticTwo
+        if setting == .sequential {
+            return "Tool calls run one at a time."
+        }
+
+        let modelLimit = capabilityProfile.parallelTools.maximumCalls
+        if modelLimit < setting.maximumCalls {
+            return "This model profile limits parallel calls to \(modelLimit)."
+        }
+        return "The active model may emit up to \(setting.maximumCalls) independent calls."
+    }
+
+    private var selectedParallelToolCalls: LocalAPIParallelToolCallsSetting {
+        LocalAPIParallelToolCallsSetting(rawValue: parallelToolCallsLimit) ?? .automaticTwo
+    }
+
+    private var settingsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            LASSectionLabel(title: "COMPATIBILITY")
+
+            Toggle("Keep screen awake while server runs", isOn: $keepScreenAwake)
+                .frame(minHeight: 44)
+            Toggle("Load selected model when app opens", isOn: $autoLoadModel)
+                .frame(minHeight: 44)
+            Toggle("Tool calling", isOn: $toolCallingEnabled)
+                .frame(minHeight: 44)
+            Toggle("Allow model reasoning", isOn: $reasoningEnabled)
+                .frame(minHeight: 44)
+            Menu {
+                ForEach(LocalAPIParallelToolCallsSetting.allCases) { setting in
+                    Button {
+                        parallelToolCallsLimit = setting.rawValue
+                    } label: {
+                        if setting.rawValue == parallelToolCallsLimit {
+                            Label(setting.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(setting.displayName)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: LASDesignTokens.tight) {
+                    Text("Parallel tool calls")
+                    Spacer(minLength: LASDesignTokens.tight)
+                    Text(selectedParallelToolCalls.displayName)
+                        .foregroundStyle(.secondary)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .disabled(!toolCallingEnabled)
+            .accessibilityLabel("Parallel tool calls")
+            .accessibilityValue(selectedParallelToolCalls.displayName)
+            .accessibilityHint("Choose the maximum number of independent tool calls the active model may emit")
+
+            Text(parallelToolCallsExplanation)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("Strict tool-schema validation", isOn: $strictToolSchemasEnabled)
+                .disabled(!toolCallingEnabled)
+                .frame(minHeight: 44)
+
+            Text("Reasoning is parsed separately from final content. Tool calls are validated after parsing and malformed calls receive one bounded repair pass.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: LASDesignTokens.tight) {
+                Text("Port")
+                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: LASDesignTokens.tight) {
+                    TextField("11434", text: $portText)
+                        .keyboardType(.numberPad)
+                        .font(.body.monospaced())
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minHeight: 44)
+                        .accessibilityLabel("Local API server port")
+                    Button("Apply", action: onApplyPort)
+                        .buttonStyle(LASSecondaryButtonStyle())
+                        .disabled(!canApplyPort)
+                }
+                if !portText.isEmpty, Int(portText) == nil {
+                    Text("Enter a numeric port from 1024 through 65535.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .toggleStyle(.switch)
+        .tint(.black)
+    }
+
+    private var connectionSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            LASSectionLabel(title: "CONNECTION URLS")
+
+            if addresses.isEmpty {
+                Text("Waiting for a Wi‑Fi or LAN address…")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(connectionEntries) { entry in
+                    LASURLRow(label: entry.label, value: entry.value) {
+                        onCopyURL(entry.value)
+                    }
+                }
+            }
+        }
+    }
+
+    private var connectionEntries: [LASConnectionEntry] {
+        var seen = Set<String>()
+        var entries: [LASConnectionEntry] = []
+        for address in addresses {
+            let openAI = "http://\(address):\(port)/v1"
+            let localBase = "http://\(address):\(port)"
+            if seen.insert(openAI).inserted {
+                entries.append(LASConnectionEntry(label: "OpenAI", value: openAI))
+            }
+            // Ollama and Anthropic use the same local base URL. Keep one
+            // copyable row instead of presenting the identical URL twice.
+            if seen.insert(localBase).inserted {
+                entries.append(LASConnectionEntry(label: "Ollama · Anthropic", value: localBase))
+            }
+        }
+        return entries
+    }
+
+    private var apiKeySection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            LASSectionLabel(title: "API KEY")
+
+            HStack(spacing: 10) {
+                Text(apiKeyVisible ? apiKey : maskedKey)
+                    .font(.footnote.monospaced())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                    .textSelection(.enabled)
+                    .privacySensitive()
+                Spacer(minLength: 4)
+                Button(apiKeyVisible ? "Hide" : "Reveal") {
+                    apiKeyVisible.toggle()
+                }
+                .buttonStyle(.borderless)
+                Button("Copy", action: onCopyKey)
+                    .buttonStyle(.borderless)
+                Button("Rotate", action: onRotateKey)
+                    .buttonStyle(.borderless)
+            }
+
+            if let copyMessage {
+                Text(copyMessage)
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            }
+        }
+    }
+
+    private var quickStartSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            LASSectionLabel(title: "LINUX QUICK START")
+
+            Text(setupCommands)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+
+            ViewThatFits {
+                HStack(spacing: LASDesignTokens.tight) {
+                    setupCopyButton
+                    setupShareButton
+                }
+                VStack(alignment: .leading, spacing: LASDesignTokens.tight) {
+                    setupCopyButton
+                    setupShareButton
+                }
+            }
+
+            Text("Copy and Share include the current API key. Send them only to a device you trust.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text("For Ollama SDKs, use the Ollama URL above and send the same Authorization bearer header.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var securityNote: some View {
+        Label {
+            Text("HTTP traffic is not encrypted. Enable this only on a trusted LAN. The server stops when iOS backgrounds the app.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } icon: {
+            Image(systemName: "exclamationmark.shield.fill")
+                .foregroundStyle(.orange)
+        }
+    }
+
+    private var isModelReady: Bool {
+        switch modelState {
+        case .ready, .generating: return true
+        case .unloaded, .loading, .failed: return false
+        }
+    }
+
+    private var isModelLoading: Bool {
+        if case .loading = modelState { return true }
         return false
     }
 
-    /// Compact thumbnail of the exact image MLX last received, with
-    /// dimensions + request id below. Diagnostic only — surfaces a
-    /// preprocessing bug instantly: if this thumb shows a sideways/cropped
-    /// image while the live preview behind it is upright/full, the bug
-    /// is in our pipeline, not the model.
-    @ViewBuilder
-    private var modelInputDebugOverlay: some View {
-        let vision = MLXVisionService.shared
-        if let img = vision.lastModelInput {
-            VStack(alignment: .leading, spacing: 4) {
-                Image(uiImage: img)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 96, height: 128)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6)
-                        .stroke(.white.opacity(0.18), lineWidth: 1))
-                if let info = vision.lastModelInputInfo {
-                    Text("\(info.inputWidth)×\(info.inputHeight)")
-                        .font(T.mono(9, .semibold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 4).padding(.vertical, 1)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(.black.opacity(0.6)))
-                    Text(info.requestID.uuidString.prefix(8).description)
-                        .font(T.mono(8))
-                        .foregroundColor(.white.opacity(0.7))
-                        .padding(.horizontal, 4).padding(.vertical, 1)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(.black.opacity(0.5)))
-                }
-            }
+    private var modelStateTitle: String {
+        switch modelState {
+        case .unloaded: return "Load model for API requests"
+        case .loading(let message): return message
+        case .ready: return "Ready for API requests"
+        case .generating: return "Serving API request"
+        case .failed(let message): return message
         }
     }
 
-    /// Unified top strip — replaces the prior left HUD + right model pill.
-    /// Layout: [status dot] model · fps · activity            ⌃⌄
-    /// The whole strip is the anchor for a SwiftUI Menu that lists the
-    /// installed visual models inline, so switching is one tap + one
-    /// tap (vs the old two-screen detour through the Models tab). A
-    /// "Browse models…" entry at the bottom still opens the full picker
-    /// sheet for downloading new ones.
-    private var lensTopStrip: some View {
-        Menu {
-            lensTopStripMenuContent
-        } label: {
-            HStack(spacing: AppSpacing.small) {
-                LensModelStatusIndicator(color: cameraModelStatusColor, isReady: activeVLMReady)
-                VStack(alignment: .leading, spacing: 1) {
-                    Label {
-                        Text(activeVLMLabel)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    } icon: {
-                        Image(systemName: "cpu")
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white)
-                    Text(activeVLMReady ? "Ready · On-device" : "On-device")
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.72))
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.65))
-            }
-            .padding(.horizontal, AppSpacing.medium)
-            .frame(maxWidth: .infinity, minHeight: 44)
-            .glassSurface(.capsule, cornerRadius: 22)
-            .environment(\.colorScheme, .dark)
-            .overlay {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(.white.opacity(0.18), lineWidth: AppStroke.hairline)
-            }
-        }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuOrder(.fixed)
-        .accessibilityLabel("Vision model: \(activeVLMLabel), \(activeVLMReady ? "ready" : "not ready"), on device")
+    private var modelStatusLabel: String {
+        if isModelReady { return "RESIDENT" }
+        if isModelLoading { return "LOADING" }
+        if case .failed = modelState { return "ISSUE" }
+        return "IDLE"
     }
 
-    /// Menu body for the lens top strip — built lazily when the menu
-    /// opens, so we can read `ModelDownloadCenter.shared.models`
-    /// directly without subscribing CameraRootView to it (subscribing
-    /// would re-render the whole camera surface on every HF progress
-    /// tick).
-    @ViewBuilder
-    private var lensTopStripMenuContent: some View {
-        let current = LocalModelRegistry.storedVisionSelectionID(settings.cameraVisualModelID)
-        let readyVLMs = lensTopStripReadyVLMs()
+    private var modelStatusSymbol: String {
+        if isModelReady { return "checkmark" }
+        if isModelLoading { return "ellipsis" }
+        if case .failed = modelState { return "exclamationmark" }
+        return "cpu"
+    }
 
-        Section(loc.t("vision model")) {
-            // FastVLM default — always present in the menu, even when
-            // not fully installed. Picking it while it's not installed
-            // surfaces a toast via applySelection's install-status
-            // check; better that than hiding the canonical option.
-            Button {
-                HapticManager.impact(.light)
-                Task { await VisualModelPickerView.applySelection(LocalModelRegistry.defaultVisionSelectionID) }
-            } label: {
-                if LocalModelRegistry.isDefaultVisionSelection(current) {
-                    Label("FastVLM (built-in)", systemImage: "checkmark")
-                } else {
-                    Text("FastVLM (built-in)")
-                }
-            }
+    private var modelStatusColor: Color {
+        if isModelReady { return .green }
+        if isModelLoading { return .blue }
+        if case .failed = modelState { return .red }
+        return .secondary
+    }
 
-            ForEach(readyVLMs, id: \.id) { model in
-                Button {
-                    HapticManager.impact(.light)
-                    Task { await VisualModelPickerView.applySelection(model.sourceRepoID) }
-                } label: {
-                    if current == model.sourceRepoID {
-                        Label(model.displayName, systemImage: "checkmark")
-                    } else {
-                        Text(model.displayName)
-                    }
-                }
-            }
-        }
-
-        Divider()
-
-        Button {
-            showVisualModelPicker = true
-        } label: {
-            Label(loc.t("Browse models…"), systemImage: "ellipsis.circle")
+    private var statusText: String {
+        switch state {
+        case .running(let port):
+            return isModelReady
+                ? "ready on port \(String(port))"
+                : "listening on port \(String(port)) · no model loaded"
+        case .starting: return "starting server"
+        case .failed(let message): return message
+        case .stopped: return "server is stopped"
         }
     }
 
-    /// Same filter VisualModelPickerView uses for its "downloaded VLMs"
-    /// section — dedup by id, skip the required FastVLM entry (handled
-    /// by the default row), and only surface entries that pass the
-    /// stricter `runStatus` gate so a half-downloaded model can't be
-    /// picked from the menu.
-    private func lensTopStripReadyVLMs() -> [DownloadableModel] {
-        var seen = Set<String>()
-        return ModelDownloadCenter.shared.models.filter { m in
-            guard m.supportsCategory(.vlm) else { return false }
-            guard !m.isRequired else { return false }
-            guard VisualModelInstallStatus.runStatus(for: m).isReady else { return false }
-            return seen.insert(m.sourceRepoID).inserted
+    private var statusColor: Color {
+        switch state {
+        case .running:
+            if isModelReady { return .green }
+            if isModelLoading { return .blue }
+            return .orange
+        case .starting: return .blue
+        case .failed: return .red
+        case .stopped: return .secondary
         }
     }
 
-    /// Trimmed activity string for the top strip. Empty when the analysis
-    /// pipeline isn't doing anything noteworthy so the line stays short.
-    private var lensTopStripActivity: String {
-        let msg = analysis.statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !msg.isEmpty else { return "" }
-        // Cap at ~16 chars so the strip never overflows on narrow devices.
-        return String(msg.prefix(18))
+    private var maskedKey: String {
+        String(repeating: "•", count: max(12, min(apiKey.count, 24)))
     }
 
-    /// Colour for the lens pill's status dot. Matches the assistant's
-    /// good/warn/bad palette so the two indicators feel consistent.
-    private var cameraModelStatusColor: Color {
-        if LocalModelRegistry.isDefaultVisionSelection(
-            LocalModelRegistry.storedVisionSelectionID(settings.cameraVisualModelID)
-        ) {
-            let status = analysis.fastVLMStatus
-            if status.canGenerate { return T.good }
-            if status.isLoading   { return T.warn }
-            return T.ink3
-        }
-        switch MLXVisionService.shared.state {
-        case .ready:      return T.good
-        case .generating: return T.accent
-        case .loading:    return T.warn
-        case .failed:     return T.bad
-        case .unloaded:   return T.ink3
-        }
-    }
-
-    /// Composite key for the live-caption follow-up burst. Changing any field
-    /// cancels the running task and restarts it — that's how a fresh mode,
-    /// interval, or user-tapped "start" actually takes effect. The
-    /// hasStartedLiveLoop bit is included so flipping the gate open kicks
-    /// the loop awake without needing a mode toggle.
-    private var liveLoopKey: String {
-        // `isLensActive` is part of the key so leaving the Lens tab flips it
-        // false → the .task(id:) is cancelled → its `defer` clears the
-        // keep-awake. This is the reliable replacement for the unreliable
-        // iOS-18 .onDisappear teardown.
-        "\(activeMode.rawValue)-\(settings.smolVLMIntervalMS)-\(hasStartedLiveLoop)-\(isLensActive)"
-    }
-
-    @State private var pinchInitialZoom: CGFloat? = nil
-
-
-    var body: some View {
-        ZStack {
-            // Hard black backdrop, full-bleed. Anything transparent in the
-            // children falls back to this — never to the (light) parent bg.
-            Color.black
-                .ignoresSafeArea(.all)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            // Camera preview — placed directly in the ZStack (no
-            // GeometryReader wrap) and forced to fill every dimension. On
-            // iOS 26 a UIViewRepresentable inside a GeometryReader can
-            // collapse to its intrinsic size when the safe-area inset is
-            // resolved twice (once by the GeometryReader, once by the
-            // `.ignoresSafeArea()` modifier), leaving a centred band of
-            // black-fallback bleeding through from the parent ZStack.
-            // Removing the GeometryReader + explicitly forcing a maxFrame
-            // is what finally clears the residual strip.
-            CameraPreviewView(session: camera.captureSession)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea(.all)
-
-            if let cameraError = camera.error {
-                VStack(spacing: AppSpacing.medium) {
-                    Image(systemName: "camera.fill")
-                        .font(.largeTitle)
-                    Text("Camera unavailable")
-                        .font(.title2.weight(.semibold))
-                    Text(cameraError.localizedDescription)
-                        .font(.subheadline)
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.secondary)
-                    if case .permissionDenied = cameraError {
-                        Button("Open Settings") {
-                            guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-                            UIApplication.shared.open(url)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                    }
-                }
-                .padding(AppSpacing.xLarge)
-                .appPanel(cameraSafe: true)
-                .padding(AppSpacing.xLarge)
-                .accessibilityElement(children: .combine)
-            }
-
-            // Transparent gesture overlay — separate from the preview so
-            // gesture sizing can't influence the preview layer's bounds.
-            // Also the right attach point for `.lensDebugOverlay()`: it's
-            // the topmost touch surface, so a long-press registered here
-            // doesn't get swallowed by anything stacked above.
-            GeometryReader { geo in
-                Color.clear
-                    .contentShape(Rectangle())
-                    .gesture(
-                        SpatialTapGesture()
-                            .onEnded { event in
-                                if lensPromptFocused || lensPanelState == .composing {
-                                    lensPromptFocused = false
-                                    KeyboardDismiss.now()
-                                    withAnimation(AppAnimation.state) {
-                                        lensPanelState = .collapsed
-                                    }
-                                    return
-                                }
-                                let p = CGPoint(
-                                    x: event.location.x / geo.size.width,
-                                    y: event.location.y / geo.size.height
-                                )
-                                camera.focus(at: p)
-                                HapticManager.impact(.light)
-                            }
-                    )
-                    .gesture(
-                        MagnificationGesture()
-                            .onChanged { scale in
-                                let base = pinchInitialZoom ?? camera.zoomFactor
-                                if pinchInitialZoom == nil { pinchInitialZoom = base }
-                                camera.setZoom(base * scale)
-                            }
-                            .onEnded { _ in pinchInitialZoom = nil }
-                    )
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 20)
-                            .onEnded { value in
-                                guard value.translation.height > 24 else { return }
-                                lensPromptFocused = false
-                                KeyboardDismiss.now()
-                                if lensPanelState == .composing {
-                                    withAnimation(AppAnimation.state) {
-                                        lensPanelState = .collapsed
-                                    }
-                                }
-                            }
-                    )
-                    .lensDebugOverlay()
-            }
-            .ignoresSafeArea(.all)
-
-            GeometryReader { geo in
-                // Code Mode is now tap-to-capture-still: the user frames the
-                // code and taps the shutter, getting a high-fidelity OCR pass
-                // routed to the code LLM. The old per-region tap-to-extract
-                // overlay is gone in favour of a clean viewfinder + framing
-                // guide (added below).
-                //
-                // Live OCR stays as an independent, opt-in overlay: when the
-                // user flips it on from the toolbar, its tappable text boxes
-                // render here regardless of mode. The service no-ops when the
-                // toggle is off, so there's no cost otherwise.
-                if liveOCR.enabled {
-                    LiveOCROverlayView(containerSize: geo.size)
-                }
-
-                // Focus reticle
-                if let p = camera.focusIndicator {
-                    FocusReticle()
-                        .position(x: p.x * geo.size.width, y: p.y * geo.size.height)
-                        .transition(.opacity)
-                        .animation(.easeOut(duration: 0.2), value: camera.focusIndicator)
-                }
-            }
-            .ignoresSafeArea()
-
-            // Top chrome — a single compact strip combines status dot,
-            // model name, FPS, and current activity into one line so the
-            // viewfinder isn't fenced in by two separate panels. The strip
-            // is tappable end-to-end and routes to the Models tab, taking
-            // over the role the old model picker pill played on the right.
-            VStack {
-                lensTopBar
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
-                Spacer()
-            }
-
-            // Scan frame (design 03) — pink corner brackets in the upper-center
-            // viewfinder area, kept clear of the mode switcher / answer card
-            // that live in the lower portion of the screen.
-            VStack {
-                scanFrame.padding(.top, 84)
-                Spacer()
-            }
-
-            // Debug overlay — shows the EXACT image the model received,
-            // post-orientation and post-resize. Off by default; toggle
-            // via Settings → INTERFACE → "show model input debug". When
-            // captions don't match the camera, this surfaces whether the
-            // pipeline is at fault (thumb mismatches preview) or the
-            // model is (thumb matches but caption is wrong).
-            if settings.showModelInputDebug {
-                modelInputDebugOverlay
-                    .padding(.leading, 16)
-                    .padding(.top, 180)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity,
-                           alignment: .topLeading)
-                    .allowsHitTesting(false)
-            }
-
-            // Setup banner — only relevant for FastVLM (code-mode default).
-            // The Download Center already toasts on completion, so this is
-            // strictly a "no model yet" affordance.
-            VStack {
-                Spacer().frame(height: 168)
-                SetupBannerView { showDownloadCenter = true }
-                    .padding(.horizontal, 16)
-                Spacer()
-            }
-            .animation(.easeOut(duration: 0.25), value: analysis.fastVLMLoaded)
-
-            // Code Mode framing guide — a centred capture rectangle with a
-            // "tap to capture" hint, replacing the old detection-count chip.
-            // Tells the user to frame the code and shoot; nothing streams
-            // until they tap the shutter.
-            if activeMode == .code, !showCodeMode {
-                CodeFramingGuide(busy: isCapturingStill)
-                    .allowsHitTesting(false)
-            }
-
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            lensBottomControls
-                .padding(.horizontal, AppSpacing.medium)
-                .padding(.bottom, AppSpacing.small)
-        }
-        .sheet(isPresented: $showAnalysisPanel, onDismiss: {
-            // Reset detent so the next presentation starts at the comfy size
-            panelDetent = .fraction(0.55)
-        }) {
-            if let result = analysis.activeResult {
-                AnalysisPanelView(result: result,
-                                  analysis: analysis,
-                                  isPresented: $showAnalysisPanel)
-                    .presentationDetents([.fraction(0.45), .fraction(0.75), .large], selection: $panelDetent)
-                    .presentationDragIndicator(.visible)
-                    .presentationCornerRadius(20)
-                    .presentationBackground(.clear)
-                    // Light selection tap each time the user snaps the
-                    // sheet to a new detent. iOS handles the actual drag
-                    // + rubber-banding; this just adds the "click" so the
-                    // detent change feels physical rather than silent.
-                    .onChange(of: panelDetent) { _, _ in
-                        HapticManager.selection()
-                    }
-            }
-        }
-        .sheet(isPresented: $showHistory) {
-            AnalysisHistoryView(analysis: analysis, openPanel: $showAnalysisPanel)
-        }
-        .sheet(isPresented: $showDownloadCenter) {
-            ModelDownloadCenterView()
-        }
-        .sheet(isPresented: $showVisualModelPicker) {
-            VisualModelPickerView()
-        }
-        .sheet(isPresented: $presetPickerSheet) {
-            LensPromptPresetSheet()
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-        }
-        .fullScreenCover(isPresented: $showDocumentScanner) {
-            DocumentScannerView { pages in
-                guard let first = pages.first else { return }
-                // Feed the first page through the standard analysis pipeline
-                analysis.analyzeImportedImage(first)
-                showAnalysisPanel = true
-                if pages.count > 1 {
-                    ToastCenter.shared.info(
-                        "\(pages.count) pages scanned",
-                        detail: "Analysing the first; share extension can handle the rest."
-                    )
-                }
-            }
-        }
-        .fullScreenCover(isPresented: $showCodeMode) {
-            CodeModeView(controller: codeMode, onRecapture: { codeMode.reset() })
-        }
-        .task { await analysis.start() }
-        // Live caption follow-up burst — runs only AFTER the user has tapped
-        // capture once this session (hasStartedLiveLoop flag). Without
-        // that gate, opening the lens tab in visual mode raced AVFoundation's
-        // first frame and MLX's lazy model load, reliably tripping a
-        // Metal command-buffer SIGABRT (mlx::core::gpu::check_error) on
-        // some devices. Tap-to-start keeps the lens tab itself always
-        // safe — MLX only runs when the user explicitly asks.
-        .task(id: liveLoopKey) {
-            guard activeMode == .visual, hasStartedLiveLoop, isLensActive else { return }
-            // Keep the screen awake while the follow-up burst runs — auto-lock
-            // would background the app and kill in-flight GPU work. The
-            // defer restores it on every exit (tab leave, mode switch,
-            // key change all cancel this task), and DeviceSafetyMonitor's
-            // background observer force-clears it as a backstop.
-            DeviceSafetyMonitor.shared.setKeepAwake(true, reason: "lens-live-loop")
-            defer { DeviceSafetyMonitor.shared.setKeepAwake(false, reason: "lens-live-loop") }
-            var remainingFollowUps = Self.liveCaptionFollowUpLimit
-            while !Task.isCancelled, remainingFollowUps > 0 {
-                let safety = DeviceSafetyMonitor.shared
-                // Minimum interval is 6000ms. The live caption burst needs the
-                // GPU to fully drain between
-                // captures or KV-cache residency accumulates and trips
-                // iokit_user_client_trap mid-decode (SIGABRT), and an
-                // unbounded loop is exactly the kind of workload that makes
-                // user devices feel hot compared with peer camera apps.
-                var ms = max(Self.minimumLiveCaptionIntervalMS,
-                             min(Self.maximumLiveCaptionIntervalMS, settings.smolVLMIntervalMS))
-                // Warm device or low-power mode → back the loop off 3×.
-                if safety.shouldThrottle || safety.lowPowerMode { ms *= 3 }
-                try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
-                if Task.isCancelled { break }
-
-                // Thermal/memory gate: when the device is unsafe for heavy
-                // work, don't capture at all — just poll until it recovers.
-                if DeviceSafetyMonitor.shared.shouldStopHeavyWork {
-                    continue
-                }
-                if !analysis.isAnalyzing {
-                    analysis.captureAndAnalyzeBest()
-                    remainingFollowUps -= 1
-                }
-            }
-            if !Task.isCancelled {
-                hasStartedLiveLoop = false
-            }
-        }
-        // Stash the latest non-empty caption so we can keep showing it while
-        // the next capture is still streaming (avoids a flicker to empty).
-        .onChange(of: analysis.activeResult?.extractedCode) { _, new in
-            if let new, !new.isEmpty { lastCaption = new }
-        }
-        // Speak the caption when low-vision (read-aloud) mode is on AND
-        // the streaming pass has just finished. Fallback path —
-        // mutually exclusive with the streaming narrator (see the
-        // `voiceSpeakInLens` gate below). Per-token TTS would
-        // otherwise stutter the speech engine; the deferred-until-
-        // complete approach gives one clean readout per scene.
-        .onChange(of: analysis.activeResult?.isStreaming) { _, isStreaming in
-            guard isStreaming == false,
-                  activeMode == .visual,
-                  let result = analysis.activeResult,
-                  !result.extractedCode.isEmpty
-            else { return }
-            // Two mutually-exclusive read-aloud paths fire on describe
-            // completion: the streaming-style narrator (voiceSpeakInLens, with
-            // scene-change dedup + its own AudioQueue) takes precedence;
-            // otherwise the plain speak-on-final path (voiceAutoRead). The
-            // narrator is fed HERE because it replaced the removed per-frame
-            // streaming pipeline — `analysis` is only in scope at this layer.
-            if settings.voiceSpeakInLens {
-                LensVoiceNarrator.shared.narrate(result.extractedCode)
-            } else if settings.voiceAutoRead {
-                VoiceService.shared.speak(result.extractedCode)
-            }
-        }
-        // Lens streaming narrator — opt-in alternative to the
-        // speak-on-final path above. Activates when the user is on
-        // the lens tab AND `voiceSpeakInLens` is on; deactivates
-        // when either condition flips. The narrator owns its own
-        // AudioQueue + frame-rate guard so the ~35fps inference loop
-        // doesn't stutter speech (see LensVoiceNarrator.swift).
-        .onAppear {
-            selectedLensMode = currentLensMode
-            ModelPrefetcher.shared.recordCameraOpen()
-            if settings.voiceSpeakInLens {
-                LensVoiceNarrator.shared.activate()
-            }
-            // Cold-launch drain: a share-extension image set pendingSharedImage
-            // before this view mounted, so the .onChange below (which skips the
-            // initial value) never fires and the image was silently dropped.
-            if let img = bridge.pendingSharedImage {
-                analysis.analyzeImportedImage(img)
-                showAnalysisPanel = true
-                bridge.pendingSharedImage = nil
-            }
-        }
-        .onChange(of: settings.voiceSpeakInLens) { _, newValue in
-            if newValue {
-                LensVoiceNarrator.shared.activate()
-            } else {
-                LensVoiceNarrator.shared.deactivate()
-            }
-        }
-        // Reset the live-loop gate when the user leaves visual mode so
-        // re-entering it requires a fresh capture tap to start the loop. A
-        // mode change is also a runtime handoff: cancel/unload the backend the
-        // old mode owned before the new mode can lazy-load its model.
-        .onChange(of: settings.analysisMode) { _, new in
-            if new != AnalysisMode.visual.rawValue {
-                hasStartedLiveLoop = false
-                MLXVisionService.shared.unload()
-                LlamaCppVLMService.shared.unload()
-                FastVLMService.shared.unload()
-            } else {
-                CodingAssistantService.shared.unload()
-            }
-        }
-        // Same on leaving the lens tab entirely — don't carry the gate
-        // across tab switches. Also tear down the streaming narrator
-        // so it doesn't keep narrating after the user navigated away.
-        // .onDisappear is unreliable on iOS 18 TabView, so the authoritative
-        // teardown is the isLensActive change below; this stays as a backstop
-        // for the cases where it does fire (app teardown, sheet cover).
-        .onDisappear {
-            hasStartedLiveLoop = false
-            lensPromptFocused = false
-            KeyboardDismiss.now()
-            analysis.cancelCurrentAnalysis()
-            LensVoiceNarrator.shared.deactivate()
-        }
-        // Reliable tab-leave teardown: when the Lens stops being the selected
-        // tab, reset the live-loop gate and stop the narrator. The loop task
-        // itself is cancelled via liveLoopKey (which includes isLensActive),
-        // and its defer clears the keep-awake — so nothing outlives the tab.
-        .onChange(of: isLensActive) { _, active in
-            if !active {
-                hasStartedLiveLoop = false
-                lensPromptFocused = false
-                KeyboardDismiss.now()
-                analysis.cancelCurrentAnalysis()
-                lensPanelState = .collapsed
-                LensVoiceNarrator.shared.deactivate()
-            } else {
-                selectedLensMode = currentLensMode
-            }
-        }
-        .onChange(of: analysis.isAnalyzing) { _, analyzing in
-            if analyzing {
-                withAnimation(AppAnimation.state) { lensPanelState = .analyzing }
-                return
-            }
-            guard activeMode == .visual else { return }
-            if lensErrorText != nil, lensResultText.isEmpty {
-                withAnimation(AppAnimation.state) { lensPanelState = .error }
-            } else if !lensResultText.isEmpty {
-                withAnimation(AppAnimation.state) { lensPanelState = .result }
-                HapticManager.analysisComplete()
-            } else if lensPanelState == .analyzing || lensPanelState == .captured {
-                withAnimation(AppAnimation.state) { lensPanelState = .error }
-            }
-        }
-        // Pick up images dropped in via the share extension
-        .onChange(of: bridge.pendingSharedImage) { _, newImage in
-            guard let img = newImage else { return }
-            analysis.analyzeImportedImage(img)
-            showAnalysisPanel = true
-            bridge.pendingSharedImage = nil
-        }
-        // Gallery import (shutter-row photo button).
-        .onChange(of: photoItem) { _, item in
-            guard let item else { return }
-            Task {
-                if let data = try? await item.loadTransferable(type: Data.self),
-                   let img = UIImage(data: data) {
-                    await MainActor.run {
-                        if activeMode != .visual {
-                            settings.analysisMode = AnalysisMode.visual.rawValue
-                        }
-                        lensPromptFocused = false
-                        KeyboardDismiss.now()
-                        lensPanelState = .analyzing
-                        analysis.analyzeImportedImage(img)
-                    }
-                }
-                await MainActor.run { photoItem = nil }
-            }
-        }
-    }
-
-    /// Caption card — compact, always-inline layout. Description hugs its
-    /// content (no fixed-height ScrollView); Copy/Share/preset and the
-    /// merged camera-toolbar row sit below it. Tap-to-expand was removed:
-    /// users complained the expanded card stretched into a huge empty
-    /// surface when the caption was short.
-    /// Per-render character cap for the streaming caption Text. CoreText's
-    /// internal Futhark line-break allocator (`Futhark createNewLineseg`)
-    /// rebuilds its line-segment buffer on every text change, and with
-    /// rapid token streaming + a long output it eventually fails its
-    /// realloc and SIGABRTs at the next store. Hard-capping the visible
-    /// string to a few KB keeps Futhark's worst-case allocation bounded.
-    /// We also drop `.textSelection(.enabled)` while a stream is in
-    /// flight — selection support triggers an extra layout pass per
-    /// change, which is what tips Futhark over the edge in practice.
-    private static let captionMaxChars = 1200
-
-    @ViewBuilder
-    private var lensBottomControls: some View {
-        VStack(spacing: AppSpacing.medium) {
-            if activeMode == .visual {
-                LensTaskPanel(
-                    state: $lensPanelState,
-                    mode: $selectedLensMode,
-                    prompt: $settings.lensCustomPrompt,
-                    promptFocused: $lensPromptFocused,
-                    thumbnail: analysis.activeResult?.thumbnail,
-                    resultText: lensResultText,
-                    errorText: lensErrorText,
-                    isBusy: analysis.isAnalyzing,
-                    canAnalyze: !visualModelMissing && !analysis.isAnalyzing,
-                    onModeChange: selectLensMode,
-                    onAnalyze: captureLensTask,
-                    onCancel: cancelLensAnalysis,
-                    onCopy: {
-                        UIPasteboard.general.string = lensResultText
-                        HapticManager.impact(.light)
-                        ToastCenter.shared.info("Copied")
-                    },
-                    onShare: { presentShareSheet(for: lensResultText) },
-                    onSpeak: { VoiceService.shared.speak(lensResultText) },
-                    onFollowUp: {
-                        settings.lensCustomPrompt = ""
-                        lensPanelState = .composing
-                        lensPromptFocused = true
-                    },
-                    onRetake: resetLensPanel,
-                    onExpand: { showAnalysisPanel = analysis.activeResult != nil }
-                )
-            } else {
-                VStack(alignment: .leading, spacing: AppSpacing.small) {
-                    Text("CODE · ON-DEVICE")
-                        .font(AppTypography.eyebrow)
-                        .foregroundStyle(.secondary)
-                    Text("Frame code and capture a still for OCR and review.")
-                        .font(.headline)
-                }
-                .padding(AppSpacing.large)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .appPanel(cameraSafe: true)
-            }
-
-            if lensPanelState == .collapsed || activeMode == .code {
-                shutterRow
-                    .padding(.horizontal, AppSpacing.large)
-                    .transition(.opacity.combined(with: .scale(scale: 0.94)))
-            }
-        }
-        .animation(AppAnimation.state, value: lensPanelState)
-    }
-
-    private var lensResultText: String {
-        analysis.activeResult?.extractedCode ?? lastCaption
-    }
-
-    private var lensErrorText: String? {
-        if let error = camera.error?.errorDescription { return error }
-        if let reason = analysis.activeResult?.fallbackReason { return reason }
-        let status = analysis.statusMessage.lowercased()
-        if status.contains("error") || status.contains("failed") {
-            return analysis.statusMessage
-        }
-        return nil
-    }
-
-    private func captureLensTask() {
-        guard !analysis.isAnalyzing, !visualModelMissing else { return }
-        lensPromptFocused = false
-        KeyboardDismiss.now()
-        withAnimation(AppAnimation.state) { lensPanelState = .captured }
-        HapticManager.capture()
-        analysis.captureAndAnalyzeBest()
-        hasStartedLiveLoop = true
-        withAnimation(AppAnimation.state) { lensPanelState = .analyzing }
-    }
-
-    private func cancelLensAnalysis() {
-        analysis.cancelCurrentAnalysis()
-        lensPromptFocused = false
-        KeyboardDismiss.now()
-        withAnimation(AppAnimation.state) { lensPanelState = .collapsed }
-    }
-
-    private func resetLensPanel() {
-        analysis.cancelCurrentAnalysis()
-        analysis.dismissActiveResult()
-        lastCaption = ""
-        lensPromptFocused = false
-        KeyboardDismiss.now()
-        withAnimation(AppAnimation.state) { lensPanelState = .collapsed }
-    }
-
-    /// Full-card empty state shown when the visual model isn't ready.
-    /// Replaces the old "tap to install model" pinned warning that the
-    /// toolbar partially occluded. Same dark glass surface as the live
-    /// caption pill so the bottom of the screen still reads as one panel.
-    private var noVisionModelCard: some View {
-        let hasSelection = !LocalModelRegistry.isDefaultVisionSelection(
-            LocalModelRegistry.storedVisionSelectionID(settings.cameraVisualModelID)
-        )
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: "eye.slash")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.white.opacity(0.65))
-                Text(loc.t(hasSelection
-                           ? "vision model not loaded"
-                           : "no vision model loaded"))
-                    .font(T.mono(11, .semibold))
-                    .tracking(0.4)
-                    .foregroundColor(.white.opacity(0.92))
-                Spacer()
-            }
-            Text(loc.t(hasSelection
-                       ? "the selected model failed to load. open the models tab to fix it."
-                       : "install a vision model to caption what the camera sees."))
-                .font(T.sans(13))
-                .foregroundColor(.white.opacity(0.7))
-                .fixedSize(horizontal: false, vertical: true)
-            Button {
-                HapticManager.impact(.medium)
-                handleMissingVisionModelAction(hasSelection: hasSelection)
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: hasSelection
-                          ? "arrow.triangle.2.circlepath"
-                          : "arrow.down.circle")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text(loc.t(missingVisionModelButtonLabel(hasSelection: hasSelection)))
-                        .font(T.mono(11, .semibold))
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(T.accentStrong)
-                )
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-        .background(Color.black.opacity(0.72))
-        .environment(\.colorScheme, .dark)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(.white.opacity(0.16), lineWidth: 1)
-        )
-    }
-
-    private func missingVisionModelButtonLabel(hasSelection: Bool) -> String {
-        guard !hasSelection,
-              let model = ModelDownloadCenter.shared.fastvlmModel else {
-            return "open models"
-        }
-        switch model.state {
-        case .ready:
-            return "load fastvlm 0.5b"
-        case .enumerating, .downloading:
-            return "view fastvlm download"
-        case .failed:
-            return "retry fastvlm download"
-        case .idle:
-            return "download fastvlm 0.5b · ~400 mb"
-        }
-    }
-
-    private func handleMissingVisionModelAction(hasSelection: Bool) {
-        guard !hasSelection else {
-            AppBridge.shared.requestModels(.lens)
-            return
-        }
-        guard let model = ModelDownloadCenter.shared.fastvlmModel else {
-            ToastCenter.shared.error("FastVLM unavailable",
-                                     detail: "The model catalog could not be loaded.")
-            AppBridge.shared.requestModels(.lens)
-            return
-        }
-        switch model.state {
-        case .ready:
-            Task { await FastVLMService.shared.load() }
-        case .enumerating, .downloading:
-            AppBridge.shared.requestModels(.lens)
-        case .idle, .failed:
-            model.start()
-            AppBridge.shared.requestModels(.lens)
-        }
-    }
-
-
-
-    /// Hands `text` to the system share sheet. The camera tab is presented
-    /// edge-to-edge with no NavigationStack, so we resolve the topmost
-    /// view controller directly.
-    private func presentShareSheet(for text: String) {
-        // Prefer the foreground-active key window, but fall back to any
-        // connected window scene's first window. On iPad multi-scene / Stage
-        // Manager — or transiently during a state change — the strict
-        // key-window lookup can miss, which used to make the Share tap a silent
-        // no-op. Surface a toast if we still can't find a presenter.
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
-        guard let scene,
-              let root = (scene.windows.first(where: \.isKeyWindow)
-                          ?? scene.windows.first)?.rootViewController
-        else {
-            ToastCenter.shared.error("Couldn't open the share sheet")
-            return
-        }
-        var top = root
-        while let presented = top.presentedViewController { top = presented }
-        let av = UIActivityViewController(activityItems: [text],
-                                          applicationActivities: nil)
-        av.popoverPresentationController?.sourceView = top.view
-        top.present(av, animated: true)
-    }
-
-    /// True when the active VLM can take natural-language prompts (basically:
-    /// any MLX VLM, or FastVLM when the full decoder is ready). OCR-only
-    /// fallback paths get hidden chips since the model can't actually obey.
-    private var supportsPromptPresets: Bool {
-        if !LocalModelRegistry.isDefaultVisionSelection(
-            LocalModelRegistry.storedVisionSelectionID(settings.cameraVisualModelID)
-        ) { return true }
-        return analysis.fastVLMStatus.canGenerate
-    }
-
-    /// True when the active visual model has no inference path available
-    /// right now — either the selected MLX VLM failed to load, or the user
-    /// is on the FastVLM default and the pipeline isn't ready. In that case
-    /// the capture button is disabled and routes to the download/picker
-    /// flow instead of swallowing a tap.
-    private var visualModelMissing: Bool {
-        // Only relevant in visual mode — code mode (OCR) always has a path.
-        guard activeMode == .visual else { return false }
-        if !LocalModelRegistry.isDefaultVisionSelection(
-            LocalModelRegistry.storedVisionSelectionID(settings.cameraVisualModelID)
-        ) {
-            // User picked an MLX VLM: must be loaded, or fail honestly.
-            if case .failed = MLXVisionService.shared.state { return true }
-            if case .ready = MLXVisionService.shared.state { return false }
-            // .loading/.unloaded/.generating count as "still warming" — allow
-            // taps so users can re-trigger after the model finishes warming.
+    private var canApplyPort: Bool {
+        guard let candidate = Int(portText), (1024...65535).contains(candidate) else {
             return false
         }
-        // Default FastVLM route: needs the full pipeline, not just encoder.
-        return !analysis.fastVLMStatus.canGenerate
+        return candidate != port
     }
 
-    // MARK: - Code Mode capture
-    //
-    // Tap-to-capture a high-fidelity still, then open CodeModeView which runs
-    // the OCR-extract → code-LLM pipeline. Independent of AnalysisService /
-    // the VLM — code reasoning goes through the chat-tab code model instead,
-    // which is far stronger on code and needs no VLM resident.
-    private func startCodeCapture() {
-        guard !isCapturingStill, !showCodeMode else { return }
-        isCapturingStill = true
-        let orientation = UIDevice.current.orientation
-        Task {
-            let buffer = await camera.captureHighResFrame()
-            isCapturingStill = false
-            guard let buffer else {
-                ToastCenter.shared.error("Couldn't capture frame")
-                return
+    private var setupCopyButton: some View {
+        Button("Copy setup", systemImage: "doc.on.doc", action: onCopySetup)
+            .buttonStyle(LASSecondaryButtonStyle())
+    }
+
+    private var setupShareButton: some View {
+        ShareLink(
+            item: setupCommandsWithAPIKey,
+            subject: Text("On Device LAS setup commands")
+        ) {
+            Label("Share setup", systemImage: "square.and.arrow.up")
+        }
+        .buttonStyle(LASSecondaryButtonStyle())
+    }
+
+    private var setupCommands: String {
+        let base = addresses.first.map { "http://\($0):\(port)" } ?? "http://<DEVICE_IP>:\(port)"
+        return "export OPENAI_BASE_URL=\(base)/v1\nexport OPENAI_API_KEY=<API_KEY>\ncurl \"$OPENAI_BASE_URL/models\" -H \"Authorization: Bearer $OPENAI_API_KEY\""
+    }
+
+    private var setupCommandsWithAPIKey: String {
+        let base = addresses.first.map { "http://\($0):\(port)" } ?? "http://<DEVICE_IP>:\(port)"
+        return "export OPENAI_BASE_URL=\(base)/v1\nexport OPENAI_API_KEY=\(apiKey)\ncurl \"$OPENAI_BASE_URL/models\" -H \"Authorization: Bearer $OPENAI_API_KEY\""
+    }
+}
+
+private struct LASModelPrimaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        LASThemedPrimaryLabel(configuration: configuration)
+    }
+
+    private struct LASThemedPrimaryLabel: View {
+        let configuration: Configuration
+        @Environment(\.koduTheme) private var T
+
+        var body: some View {
+            configuration.label
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, minHeight: 48)
+                .background(
+                    T.accentStrong.opacity(configuration.isPressed ? 0.76 : 1),
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                )
+                .scaleEffect(configuration.isPressed ? 0.985 : 1)
+        }
+    }
+}
+
+private struct LASModelSecondaryButtonStyle: ButtonStyle {
+    var foreground: Color = .primary
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(foreground)
+            .frame(maxWidth: .infinity, minHeight: 48)
+            .background(
+                Color.primary.opacity(configuration.isPressed ? 0.11 : 0.055),
+                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(LASDesignTokens.hairline, lineWidth: 1)
             }
-            codeMode.begin(pixelBuffer: buffer, deviceOrientation: orientation)
-            showCodeMode = true
+    }
+}
+
+private struct LASConnectionEntry: Identifiable {
+    let label: String
+    let value: String
+
+    var id: String { "\(label)|\(value)" }
+}
+
+private struct LASModelPickerView: View {
+    let currentModel: AssistantModel
+    let onSelect: (AssistantModel) -> Void
+    let onOpenModels: () -> Void
+    @ObservedObject private var modelCenter = ModelDownloadCenter.shared
+    @Environment(\.dismiss) private var dismiss
+
+    /// Only models whose complete files are already on-device belong in the
+    /// load picker. The catalog is intentionally not a fallback here: its
+    /// entries describe models that *can* be downloaded, not models that the
+    /// local API can load right now. Imported models use the same
+    /// `DownloadableModel` path after registration, so they appear alongside
+    /// downloaded catalog models once their validator reports `.ready`.
+    private var models: [AssistantModel] {
+        var result: [AssistantModel] = []
+        var seenRepoIDs = Set<String>()
+
+        for downloadable in modelCenter.models
+            where downloadable.isReady
+                // The picker forces the text-runtime descriptor below. Do
+                // not rely on the catalog's primary category here: some
+                // text models expose a generic *ForConditionalGeneration
+                // architecture and are classified as VLM during disk scan.
+                // Voice and image-only packages are the only categories that
+                // cannot be API assistant candidates.
+                && downloadable.category != .voice
+                && downloadable.category != .imageGen {
+            guard let model = LocalModelRegistry
+                .descriptor(for: downloadable, forcedRole: .assistant)
+                .assistantModel else { continue }
+
+            let repoKey = model.repoID.lowercased()
+            guard seenRepoIDs.insert(repoKey).inserted else { continue }
+            result.append(model)
+        }
+
+        return result.sorted { lhs, rhs in
+            let lhsIsCurrent = lhs.id == currentModel.id
+            let rhsIsCurrent = rhs.id == currentModel.id
+            if lhsIsCurrent != rhsIsCurrent { return lhsIsCurrent }
+            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
+                == .orderedAscending
         }
     }
 
-    // MARK: - Lens design-03 chrome
-
-    /// Top bar: × close · model/status pill · ⋯ more.
-    private var lensTopBar: some View {
-        HStack(spacing: 10) {
-            lensCircleButton("xmark") { onClose() }
-            lensTopStrip
-            lensMoreMenu
-        }
-    }
-
-    private func lensCircleButton(_ icon: String, action: @escaping () -> Void) -> some View {
-        Button {
-            HapticManager.impact(.light); action()
-        } label: {
-            Image(systemName: icon)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(.white)
-                .frame(width: 44, height: 44)
-                .glassSurface(.toolbarButton, cornerRadius: 22)
-                .overlay(Circle().stroke(.white.opacity(0.16), lineWidth: 1))
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(icon == "xmark" ? "Close Lens" : "Lens control")
-    }
-
-    /// ⋯ menu — the contextual actions that used to live in the bottom
-    /// toolbar (history, document scan, read-aloud, OCR, model, mode).
-    private var lensMoreMenu: some View {
-        Menu {
-            Button {
-                showHistory = true; HapticManager.impact(.light)
-            } label: { Label(loc.t("history"), systemImage: "clock.arrow.circlepath") }
-
-            Button {
-                showDocumentScanner = true; HapticManager.impact(.light)
-            } label: { Label(loc.t("scan"), systemImage: "doc.viewfinder") }
-
-            Button {
-                settings.voiceAutoRead.toggle(); HapticManager.impact(.light)
-                if settings.voiceAutoRead, !visualModelMissing {
-                    if activeMode != .visual { settings.analysisMode = AnalysisMode.visual.rawValue }
-                    analysis.captureAndAnalyzeBest(); hasStartedLiveLoop = true
-                } else if settings.voiceAutoRead {
-                    // Turned ON but no vision model installed — tell the user
-                    // instead of leaving the toggle a silent no-op.
-                    ToastCenter.shared.info("Install a vision model first",
-                                            detail: "Read-aloud needs a vision model to describe the scene.")
+    var body: some View {
+        NavigationStack {
+            List {
+                if models.isEmpty {
+                    VStack(spacing: 12) {
+                        ContentUnavailableView(
+                            "No ready models",
+                            systemImage: "internaldrive",
+                            description: Text(
+                                "Download or import a model from the Models tab before loading the local API."
+                            )
+                        )
+                        Button("Open Models", systemImage: "arrow.down.circle", action: onOpenModels)
+                            .buttonStyle(.borderedProminent)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .listRowSeparator(.hidden)
                 } else {
-                    VoiceService.shared.stop()
-                }
-            } label: {
-                Label(settings.voiceAutoRead ? loc.t("aloud") + " · on" : loc.t("aloud") + " · off",
-                      systemImage: settings.voiceAutoRead ? "ear.fill" : "ear")
-            }
-
-            Button {
-                LiveOCRService.shared.enabled.toggle(); HapticManager.impact(.light)
-            } label: {
-                Label(LiveOCRService.shared.enabled ? loc.t("ocr") + " · on" : loc.t("ocr") + " · off",
-                      systemImage: "text.viewfinder")
-            }
-
-            Divider()
-
-            Button {
-                AppBridge.shared.requestTab(.models); HapticManager.impact(.light)
-            } label: { Label(loc.t("model"), systemImage: "eye") }
-
-            Button {
-                let next = activeMode == .code ? AnalysisMode.visual : AnalysisMode.code
-                settings.analysisMode = next.rawValue; HapticManager.impact(.light)
-            } label: {
-                Label(activeMode == .visual ? loc.t("switch to code") : loc.t("switch to visual"),
-                      systemImage: activeMode.systemImage)
-            }
-        } label: {
-            Image(systemName: "ellipsis")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(.white)
-                .frame(width: 44, height: 44)
-                .glassSurface(.toolbarButton, cornerRadius: 22)
-                .overlay(Circle().stroke(.white.opacity(0.16), lineWidth: 1))
-        }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuOrder(.fixed)
-        .accessibilityLabel("More Lens options")
-    }
-
-    // MARK: Scan frame
-
-    private var scanFrame: some View {
-        LensScanFrame(accent: currentLensMode.accent, isScanning: activeMode == .visual && analysis.isAnalyzing)
-            .frame(width: 220, height: 220)
-            .overlay(alignment: .top) {
-                if activeMode == .visual, analysis.isAnalyzing {
-                    Text(loc.t("Scanning…"))
-                        .font(T.sans(12, .semibold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12).padding(.vertical, 5)
-                        .background(Capsule().fill(Color.black.opacity(0.72)))
-                        .offset(y: -30)
-                        .transition(.opacity)
-                }
-            }
-            .allowsHitTesting(false)
-            .animation(.easeInOut(duration: 0.2), value: analysis.isAnalyzing)
-    }
-
-    // MARK: Mode switcher
-
-    private var currentLensMode: LensMode {
-        LensMode.from(preset: LensPromptPreset.from(rawValue: settings.lensPromptPresetID))
-    }
-
-    private func selectLensMode(_ m: LensMode) {
-        HapticManager.selection()
-        selectedLensMode = m
-        lensPromptFocused = false
-        KeyboardDismiss.now()
-        settings.lensCustomPrompt = ""
-        settings.lensPromptPresetID = m.preset.rawValue
-        if activeMode != .visual { settings.analysisMode = AnalysisMode.visual.rawValue }
-        analysis.cancelCurrentAnalysis()
-        analysis.dismissActiveResult()
-        lastCaption = ""
-        withAnimation(AppAnimation.state) { lensPanelState = .collapsed }
-    }
-
-    private func submitCustomLensPrompt() {
-        let trimmed = settings.lensCustomPrompt
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !analysis.isAnalyzing, !visualModelMissing else { return }
-        settings.lensCustomPrompt = String(trimmed.prefix(240))
-        if activeMode != .visual { settings.analysisMode = AnalysisMode.visual.rawValue }
-        HapticManager.impact(.medium)
-        analysis.captureAndAnalyzeBest()
-        hasStartedLiveLoop = true
-    }
-
-    private func clearCustomLensPrompt() {
-        settings.lensCustomPrompt = ""
-        HapticManager.impact(.light)
-    }
-
-    private var modeSwitcher: some View {
-        HStack(spacing: 7) {
-            ForEach(LensMode.allCases) { m in
-                let on = currentLensMode == m
-                Button { selectLensMode(m) } label: {
-                    Text(loc.t(m.label))
-                        .font(T.sans(13, on ? .semibold : .medium))
-                        .foregroundColor(.white.opacity(on ? 0.96 : 0.72))
-                        .padding(.horizontal, on ? 18 : 15)
-                        .padding(.vertical, 8)
-                        .background(
-                            ZStack {
-                                Capsule().fill(Color.black.opacity(on ? 0.78 : 0.44))
-                                if on {
-                                    Capsule().stroke(.white.opacity(0.22), lineWidth: 1)
+                    ForEach(models) { model in
+                        Button {
+                            onSelect(model)
+                        } label: {
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(model.displayName)
+                                        .font(.body.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                    Text(model.subtitle)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if model.id == currentModel.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.green)
                                 }
                             }
-                        )
-                        .overlay(Capsule().stroke(.white.opacity(on ? 0.22 : 0.12), lineWidth: 1))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
-                .buttonStyle(.plain)
+            }
+            .navigationTitle("Choose API model")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+            .task {
+                modelCenter.refreshAllStates()
             }
         }
-        .animation(.easeInOut(duration: 0.18), value: currentLensMode)
     }
+}
 
-    // MARK: Answer card (white, design 03)
+private struct LASURLRow: View {
+    let label: String
+    let value: String
+    let action: () -> Void
 
-    private var cardInk: Color { Color(red: 0.110, green: 0.110, blue: 0.118) }
-    private var cardInk2: Color { Color(red: 0.42, green: 0.42, blue: 0.45) }
-
-    private var answerCard: some View {
-        let mode = currentLensMode
-        let result = analysis.activeResult
-        let answer: String = {
-            if let r = result, r.mode == .visual, !r.extractedCode.isEmpty { return r.extractedCode }
-            if !lastCaption.isEmpty { return lastCaption }
-            return ""
-        }()
-        let streaming = (result?.isStreaming ?? false)
-        let capped = answer.count > Self.captionMaxChars ? String(answer.suffix(Self.captionMaxChars)) : answer
-        return VStack(alignment: .leading, spacing: 7) {
-            Text("\(loc.t(mode.label).uppercased()) · \(loc.t("ON-DEVICE"))")
-                .font(T.sans(11, .bold)).tracking(0.5)
-                .foregroundColor(T.accentStrong)
-            Text(settings.lensCustomPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                 ? loc.t(mode.question)
-                 : settings.lensCustomPrompt)
-                .font(T.sans(17, .semibold)).foregroundColor(cardInk)
-            if streaming && capped.isEmpty {
-                HStack(spacing: 8) {
-                    ProgressView().tint(T.accent).scaleEffect(0.8)
-                    Text(loc.t("Looking…")).font(T.sans(14)).foregroundColor(cardInk2)
-                }
-            } else if !capped.isEmpty {
-                Text(capped)
-                    .font(T.sans(14.5)).foregroundColor(cardInk2).lineSpacing(2)
-                    .lineLimit(6).truncationMode(.tail)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .modifier(StreamSafeTextSelection(streaming: streaming))
-            } else {
-                Text(loc.t("Point at something and tap the shutter."))
-                    .font(T.sans(14)).foregroundColor(cardInk2)
-            }
-            HStack(spacing: 8) {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.black.opacity(0.10))
-                    .frame(width: 22, height: 22)
-                Text(streaming ? loc.t("Identifying on-device…") : loc.t("Identified on-device"))
-                    .font(T.sans(12)).foregroundColor(cardInk2)
+    var body: some View {
+        ViewThatFits {
+            HStack(spacing: LASDesignTokens.row) {
+                Text(label)
+                    .font(.subheadline.weight(.semibold))
+                Text(value)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
                 Spacer(minLength: 0)
-                if !capped.isEmpty && !streaming {
-                    Button {
-                        UIPasteboard.general.string = capped; HapticManager.impact(.medium)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 13, weight: .semibold)).foregroundColor(cardInk2)
-                            .frame(width: 30, height: 30)
-                            .background(Circle().fill(Color.black.opacity(0.06)))
-                    }.buttonStyle(.plain)
-                }
+                copyButton
             }
-            .padding(.top, 2)
+            VStack(alignment: .leading, spacing: LASDesignTokens.micro) {
+                HStack {
+                    Text(label)
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    copyButton
+                }
+                Text(value)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        // ponytail: opaque white card, not glass — clear glass renders the
-        // dark ink text unreadable over the live camera feed. Matches the
-        // `fallbackFill: .white` the design already asked for.
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white)
-                .shadow(color: .black.opacity(0.18), radius: 12, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(.black.opacity(streaming ? 0.20 : 0.08), lineWidth: 1)
-        )
+        .frame(minHeight: 48)
     }
 
-    // MARK: Shutter row
-
-    private var shutterRow: some View {
-        HStack {
-            PhotosPicker(selection: $photoItem, matching: .images, photoLibrary: .shared()) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.black.opacity(0.72))
-                    Image(systemName: "photo.on.rectangle")
-                        .font(.system(size: 16, weight: .semibold)).foregroundColor(.white)
-                }
-                .frame(width: 40, height: 40)
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.18), lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-            .minimumInteractiveSize()
-            .accessibilityLabel("Import a photo")
-            .accessibilityHint("Choose an image from the photo library to analyze")
-
-            Spacer()
-
-            captureButton
-
-            Spacer()
-
-            // Right control — torch when available, else document scan.
-            if camera.torchAvailable {
-                lensCircleButton(camera.torchOn ? "bolt.fill" : "bolt.slash.fill") {
-                    camera.toggleTorch()
-                }
-            } else {
-                lensCircleButton("doc.viewfinder") { showDocumentScanner = true }
-            }
+    private var copyButton: some View {
+        Button(action: action) {
+            Image(systemName: "doc.on.doc")
+                .foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
         }
-    }
-
-    private var captureButton: some View {
-        let missing = visualModelMissing
-        return Button {
-            // Missing-model tap routes into the download/picker flow rather
-            // than firing a useless analyze. Matches the spec's Part 12.
-            if missing {
-                // Missing model — route the user to the Models tab.
-                // Whether they need to download (cameraVisualModelID
-                // empty → catalog section) or fix a failed load
-                // (cameraVisualModelID set → installed section), the
-                // Models tab is the right destination.
-                HapticManager.impact(.medium)
-                AppBridge.shared.requestTab(.models)
-                return
-            }
-            guard !analysis.isAnalyzing else { return }
-            withAnimation(.spring(response: 0.2, dampingFraction: 0.5)) { captureButtonScale = 0.92 }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { captureButtonScale = 1.0 }
-            }
-            if activeMode == .visual {
-                // Visual mode: force an immediate refresh of the caption
-                // card. Tapping capture also flips on the follow-up burst
-                // gate so the scene updates a couple more times without
-                // turning the phone into a continuous VLM workload.
-                captureLensTask()
-            } else {
-                // Code mode: tap-to-capture a high-fidelity still, OCR it,
-                // and hand the text to the code LLM in CodeModeView.
-                HapticManager.capture()
-                startCodeCapture()
-            }
-        } label: {
-            ZStack {
-                Circle()
-                    .fill(missing ? Color(white: 0.28) : Color.white)
-                    .frame(width: 68, height: 68)
-                Circle()
-                    .stroke(.white.opacity(missing ? 0.4 : 0.95), lineWidth: 4)
-                    .frame(width: 82, height: 82)
-                Image(systemName: missing
-                      ? "exclamationmark.triangle.fill"
-                      : (analysis.isAnalyzing ? "hourglass" : "camera.viewfinder"))
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundColor(missing ? .white : .black)
-                    .contentTransition(.symbolEffect(.replace))
-            }
-        }
-        .buttonStyle(.plain)
-        .scaleEffect(captureButtonScale)
-        .disabled(analysis.isAnalyzing && !missing)
-        .accessibilityLabel(missing ? "Vision model unavailable" : "Capture frame")
-        .accessibilityHint(missing ? "Opens Models so you can install a vision model" : "Captures and analyzes the current camera frame on device")
-        // The missing-model hint is now carried by `noVisionModelCard`
-        // above (full-card empty state) per README §Lens. Capture button
-        // stays unlabelled in both states so the merged toolbar below
-        // doesn't fight a small red label for attention.
+        .buttonStyle(.borderless)
+        .accessibilityLabel("Copy \(label) URL")
     }
 }
 
-private struct LensModelStatusIndicator: View {
-    let color: Color
-    let isReady: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var breathing = false
+private struct LASDeveloperEndpoint: Identifiable {
+    let method: String
+    let path: String
+
+    var id: String { "\(method) \(path)" }
+}
+
+private struct LASDeveloperEndpointsCard: View {
+    let address: String?
+    let port: Int
+    let onCopyURL: (String) -> Void
+
+    private static let openAIEndpoints = [
+        LASDeveloperEndpoint(method: "GET", path: "/v1"),
+        LASDeveloperEndpoint(method: "GET", path: "/v1/models"),
+        LASDeveloperEndpoint(method: "GET", path: "/v1/models/{model}"),
+        LASDeveloperEndpoint(method: "POST", path: "/v1/chat/completions"),
+        LASDeveloperEndpoint(method: "POST", path: "/v1/responses")
+    ]
+    private static let anthropicEndpoints = [
+        LASDeveloperEndpoint(method: "POST", path: "/v1/messages")
+    ]
+    private static let ollamaEndpoints = [
+        LASDeveloperEndpoint(method: "GET", path: "/api/tags"),
+        LASDeveloperEndpoint(method: "GET", path: "/api/ps"),
+        LASDeveloperEndpoint(method: "GET", path: "/api/version"),
+        LASDeveloperEndpoint(method: "POST", path: "/api/show"),
+        LASDeveloperEndpoint(method: "POST", path: "/api/chat"),
+        LASDeveloperEndpoint(method: "POST", path: "/api/generate")
+    ]
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(color.opacity(0.24))
-                .frame(width: 14, height: 14)
-                .scaleEffect(breathing ? 1.25 : 0.78)
-            Circle().fill(color).frame(width: 7, height: 7)
-        }
-        .onAppear {
-            guard isReady, !reduceMotion else { return }
-            withAnimation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true)) { breathing = true }
-        }
-        .accessibilityHidden(true)
-    }
-}
-
-private struct LensScanFrame: View {
-    let accent: Color
-    let isScanning: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var breathing = false
-    @State private var beamPosition: CGFloat = -1
-
-    var body: some View {
-        ZStack {
-            ScanCornersShape(cornerLength: 34, radius: 8)
-                .stroke(.white.opacity(isScanning ? 0.94 : 0.72), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-                .shadow(color: accent.opacity(isScanning ? 0.75 : 0.32), radius: isScanning ? 10 : 5)
-                .scaleEffect(breathing ? 1.012 : 0.995)
-
-            if isScanning {
-                LinearGradient(colors: [.clear, accent.opacity(0.5), .white.opacity(0.7), .clear], startPoint: .top, endPoint: .bottom)
-                    .frame(height: 34)
-                    .offset(y: beamPosition * 92)
-                    .mask(RoundedRectangle(cornerRadius: 24, style: .continuous))
-                    .transition(.opacity)
-            }
-        }
-        .onAppear { updateAnimations() }
-        .onChange(of: isScanning) { _, _ in updateAnimations() }
-        .accessibilityHidden(true)
-    }
-
-    private func updateAnimations() {
-        guard !reduceMotion else { return }
-        withAnimation(.easeInOut(duration: 2.2).repeatForever(autoreverses: true)) { breathing = true }
-        if isScanning {
-            beamPosition = -1
-            withAnimation(.easeInOut(duration: 1.35).repeatForever(autoreverses: true)) { beamPosition = 1 }
-        } else {
-            beamPosition = -1
-        }
-    }
-}
-
-// MARK: - Live Lens question composer
-
-/// A compact, camera-safe prompt surface for VLMs that accept natural-language
-/// instructions. It stays separate from `CameraRootView` so typing only
-/// invalidates this small subtree rather than the full preview hierarchy.
-private struct LensPromptComposer: View {
-    @Binding var prompt: String
-    let isBusy: Bool
-    let onAsk: () -> Void
-    let onClear: () -> Void
-
-    @FocusState private var isFocused: Bool
-
-    private var trimmedPrompt: String {
-        prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "text.bubble")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.72))
-
-            TextField("Ask about what the camera sees…", text: $prompt, axis: .vertical)
-                .font(.subheadline)
-                .foregroundStyle(.white)
-                .tint(.white)
-                .focused($isFocused)
-                .lineLimit(1...3)
-                .submitLabel(.go)
-                .onSubmit(onAsk)
-                .onChange(of: prompt) { _, newValue in
-                    if newValue.count > 240 {
-                        prompt = String(newValue.prefix(240))
-                    }
-                }
-
-            if !trimmedPrompt.isEmpty {
-                Button(action: onClear) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.62))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear Lens question")
-            }
-
-            Button(action: onAsk) {
-                ZStack {
-                    Circle()
-                        .fill(trimmedPrompt.isEmpty || isBusy
-                              ? Color.white.opacity(0.12)
-                              : Color.white)
-                        .frame(width: 34, height: 34)
-                    if isBusy {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(.white)
-                    } else {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(trimmedPrompt.isEmpty ? .white.opacity(0.45) : .black)
-                    }
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "chevron.left.forwardslash.chevron.right")
+                    .font(.title2.weight(.semibold))
+                    .frame(width: 34)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Developer endpoints")
+                        .font(.headline)
+                    Text("Complete LAN URLs for OpenCode, OpenAI, Anthropic, and Ollama clients.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .buttonStyle(.plain)
-            .disabled(trimmedPrompt.isEmpty || isBusy)
-            .accessibilityLabel("Ask Lens")
+
+            LASDeveloperEndpointSection(
+                title: "OPENAI · OPENCODE",
+                baseURL: baseURL,
+                endpoints: Self.openAIEndpoints,
+                onCopyURL: onCopyURL
+            )
+
+            LASDeveloperEndpointSection(
+                title: "ANTHROPIC",
+                baseURL: baseURL,
+                endpoints: Self.anthropicEndpoints,
+                onCopyURL: onCopyURL
+            )
+
+            LASDeveloperEndpointSection(
+                title: "OLLAMA",
+                baseURL: baseURL,
+                endpoints: Self.ollamaEndpoints,
+                onCopyURL: onCopyURL
+            )
+
+            Label(
+                "All routes require the API key through Authorization: Bearer or X-API-Key.",
+                systemImage: "key.horizontal"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
-        .padding(.leading, 14)
-        .padding(.trailing, 8)
-        .padding(.vertical, 8)
-        .background(.black.opacity(0.68), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(.white.opacity(isFocused ? 0.34 : 0.16), lineWidth: 1)
-        }
-        .animation(.easeOut(duration: 0.16), value: isFocused)
+        .lasCard(radius: 24, padding: 20)
+    }
+
+    private var baseURL: String {
+        "http://\(address ?? "<DEVICE_IP>"):\(port)"
     }
 }
 
-// MARK: - LensMode (design-03 mode switcher)
-// The four camera "modes" map onto LensPromptPreset values so the existing
-// VLM pipeline drives them unchanged — selecting a mode just swaps the prompt.
-enum LensMode: String, CaseIterable, Identifiable {
-    case ask, translate, scan, solve
-    var id: String { rawValue }
-    var label: String {
-        switch self {
-        case .ask: return "Ask"
-        case .translate: return "Translate"
-        case .scan: return "Scan"
-        case .solve: return "Solve"
-        }
-    }
-    var question: String {
-        switch self {
-        case .ask: return "What am I looking at?"
-        case .translate: return "What does this say in English?"
-        case .scan: return "Transcribe the text"
-        case .solve: return "Solve what's shown"
-        }
-    }
-    var preset: LensPromptPreset {
-        switch self {
-        case .ask: return .describe
-        case .translate: return .translate
-        case .scan: return .extractCode
-        case .solve: return .solve
-        }
-    }
-    static func from(preset: LensPromptPreset) -> LensMode {
-        switch preset {
-        case .translate: return .translate
-        case .extractCode, .reviewCode, .findErrors, .explainUI: return .scan
-        case .solve: return .solve
-        default: return .ask
-        }
-    }
-}
-
-// MARK: - ScanCornersShape
-// Four rounded L-brackets forming the centered viewfinder frame (design 03).
-struct ScanCornersShape: Shape {
-    var cornerLength: CGFloat = 34
-    var radius: CGFloat = 8
-    func path(in rect: CGRect) -> Path {
-        var p = Path()
-        let l = cornerLength, r = radius
-        // top-left
-        p.move(to: CGPoint(x: rect.minX, y: rect.minY + l))
-        p.addLine(to: CGPoint(x: rect.minX, y: rect.minY + r))
-        p.addQuadCurve(to: CGPoint(x: rect.minX + r, y: rect.minY), control: CGPoint(x: rect.minX, y: rect.minY))
-        p.addLine(to: CGPoint(x: rect.minX + l, y: rect.minY))
-        // top-right
-        p.move(to: CGPoint(x: rect.maxX - l, y: rect.minY))
-        p.addLine(to: CGPoint(x: rect.maxX - r, y: rect.minY))
-        p.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY + r), control: CGPoint(x: rect.maxX, y: rect.minY))
-        p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + l))
-        // bottom-right
-        p.move(to: CGPoint(x: rect.maxX, y: rect.maxY - l))
-        p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - r))
-        p.addQuadCurve(to: CGPoint(x: rect.maxX - r, y: rect.maxY), control: CGPoint(x: rect.maxX, y: rect.maxY))
-        p.addLine(to: CGPoint(x: rect.maxX - l, y: rect.maxY))
-        // bottom-left
-        p.move(to: CGPoint(x: rect.minX + l, y: rect.maxY))
-        p.addLine(to: CGPoint(x: rect.minX + r, y: rect.maxY))
-        p.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.maxY - r), control: CGPoint(x: rect.minX, y: rect.maxY))
-        p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - l))
-        return p
-    }
-}
-
-// MARK: - CaptureAura
-//
-// Pulsing concentric rings behind the capture disc while inference is in
-// flight. Each ring scales 0.85 → 1.45 and fades to zero opacity over its
-// cycle, staggered so the eye reads a continuous outward sonar wave.
-//
-// Lives in its own subview so the repeat-forever animation isolates from
-// the parent's redraw cycle — otherwise every analysis-state change in
-// CameraRootView would reinstall the animation and the rings would jitter.
-
-private struct CaptureAura: View {
-    let color: Color
-    var diameter: CGFloat = 68
-
-    @State private var phase: CGFloat = 0
+private struct LASDeveloperEndpointSection: View {
+    let title: LocalizedStringResource
+    let baseURL: String
+    let endpoints: [LASDeveloperEndpoint]
+    let onCopyURL: (String) -> Void
 
     var body: some View {
-        ZStack {
-            ForEach(0..<2, id: \.self) { i in
-                Circle()
-                    .stroke(color.opacity(0.55), lineWidth: 2)
-                    .frame(width: diameter, height: diameter)
-                    .scaleEffect(0.85 + (phase * 0.6))
-                    .opacity(Double(1.0 - phase))
-                    .animation(
-                        .easeOut(duration: 1.6)
-                            .repeatForever(autoreverses: false)
-                            .delay(Double(i) * 0.8),
-                        value: phase
-                    )
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.caption.weight(.bold).monospaced())
+                .foregroundStyle(.secondary)
+
+            ForEach(endpoints) { endpoint in
+                LASDeveloperEndpointRow(
+                    method: endpoint.method,
+                    url: baseURL + endpoint.path,
+                    onCopyURL: onCopyURL
+                )
             }
         }
-        .onAppear { phase = 1 }
     }
 }
 
-// MARK: - StreamingGradientEdge
-//
-// 1px conic-gradient edge that rotates around the host card while the
-// VLM is streaming. Animating the AngularGradient's `angle` parameter
-// re-rasterizes the gradient texture every frame, which jittered when
-// stacked on top of the live camera + token-stream redraws. Instead,
-// the gradient is built once and rotated via `.rotationEffect`, which
-// the render server handles as a transform on the cached layer. No
-// `.drawingGroup()` — the offscreen Metal pass that forces crashes
-// the app if the gradient is still animating while the app drops to
-// the background (Metal won't accept GPU submissions from a
-// background process).
-
-private struct StreamingGradientEdge: View {
-    let cornerRadius: CGFloat
-    let color: Color
-    let active: Bool
-
-    @State private var rotation: Double = 0
+private struct LASDeveloperEndpointRow: View {
+    let method: String
+    let url: String
+    let onCopyURL: (String) -> Void
 
     var body: some View {
-        AngularGradient(
-            gradient: Gradient(colors: [
-                color.opacity(0.0),
-                color.opacity(0.85),
-                color.opacity(0.35),
-                color.opacity(0.85),
-                color.opacity(0.0),
-            ]),
-            center: .center
-        )
-        .rotationEffect(.degrees(rotation))
-        .mask(
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .strokeBorder(Color.black, lineWidth: 1)
-        )
-        .opacity(active ? 1 : 0)
-        .animation(.easeInOut(duration: 0.25), value: active)
-        .onAppear { startIfNeeded() }
-        .onChange(of: active) { _, _ in startIfNeeded() }
-        .allowsHitTesting(false)
-    }
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(method)
+                .font(.caption2.weight(.bold).monospaced())
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .leading)
 
-    private func startIfNeeded() {
-        guard active else { return }
-        rotation = 0
-        withAnimation(.linear(duration: 2.4).repeatForever(autoreverses: false)) {
-            rotation = 360
-        }
-    }
-}
+            Text(url)
+                .font(.caption.monospaced())
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
 
-// MARK: - CaptionSkeleton
-//
-// Three pulsing skeleton lines, used as the empty-streaming state of the
-// caption pill. Each line pulses on a staggered delay so the eye reads a
-// rolling "still working" rhythm rather than three lines breathing in
-// unison.
+            Spacer(minLength: 0)
 
-private struct CaptionSkeleton: View {
-    @State private var phase: Bool = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(0..<3, id: \.self) { i in
-                RoundedRectangle(cornerRadius: 3, style: .continuous)
-                    .fill(Color.white.opacity(0.10))
-                    .frame(maxWidth: i == 2 ? 180 : .infinity)
-                    .frame(height: 10)
-                    .opacity(phase ? 1.0 : 0.35)
-                    .animation(
-                        .easeInOut(duration: 1.2)
-                            .repeatForever(autoreverses: true)
-                            .delay(Double(i) * 0.18),
-                        value: phase
-                    )
+            Button {
+                onCopyURL(url)
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .foregroundStyle(.secondary)
             }
-        }
-        .onAppear { phase = true }
-    }
-}
-
-
-// MARK: - StreamSafeTextSelection
-// Toggles `.textSelection(.enabled)` only when the stream has settled.
-// Selection support forces CoreText to retain selection-anchor state across
-// every layout pass — combined with rapid token-by-token updates from the
-// VLM, that pushes Futhark's line-segment allocator (the one in the crash
-// report) over its capacity and the next store SIGABRTs. Disabling
-// selection while streaming, then re-enabling once the result is final,
-// gives users the copy-from-text affordance without the crash risk.
-//
-// `.textSelection(.enabled)` and `.textSelection(.disabled)` return
-// different opaque types, so the conditional has to branch at the type
-// level via @ViewBuilder.
-
-struct StreamSafeTextSelection: ViewModifier {
-    let streaming: Bool
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if streaming {
-            content.textSelection(.disabled)
-        } else {
-            content.textSelection(.enabled)
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Copy \(method) endpoint URL")
         }
     }
 }
 
-// MARK: - FocusReticle
-// Small animated square shown briefly at the user's tap-to-focus point.
-
-struct FocusReticle: View {
-    @State private var scale: CGFloat = 1.6
-    @State private var opacity: Double = 0.0
-    @Environment(\.koduTheme) private var T
-
+private struct LASCardDivider: View {
     var body: some View {
-        Rectangle()
-            .stroke(T.warn, lineWidth: 1)
-            .frame(width: 64, height: 64)
-            .scaleEffect(scale)
-            .opacity(opacity)
-            .onAppear {
-                withAnimation(.easeOut(duration: 0.18)) {
-                    scale = 1.0
-                    opacity = 1.0
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
-                    withAnimation(.easeIn(duration: 0.25)) {
-                        opacity = 0.0
-                    }
-                }
-            }
+        Divider()
+            .overlay(LASDesignTokens.hairline)
     }
-}
-
-#Preview {
-    ContentView()
-        .preferredColorScheme(.dark)
 }

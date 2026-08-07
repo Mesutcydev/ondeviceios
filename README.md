@@ -21,6 +21,12 @@ Ollama-compatible local APIs, structured tool calling, and a paired Mac agent
 channel. iOS Local LLM is an agent-compatible workbench; it does not silently
 execute machine actions or send local inference to a cloud service.
 
+The generated `OnDeviceLAS` target is the current server-only distribution of
+this source tree. It keeps local model loading, safety policy, and the
+authenticated API surface while omitting the assistant, lens, voice, and
+paired-Mac UI from the shipped app. The broader source catalog remains
+available for reuse and reference.
+
 The app was previously distributed through the App Store. This repository is
 now the canonical source distribution. There is currently no official
 pre-built binary or App Store release.
@@ -151,10 +157,10 @@ Generate the Xcode project and install CocoaPods:
 ```bash
 xcodegen generate
 pod install
-open IOSLocalLLM.xcworkspace
+open OnDeviceLAS.xcworkspace
 ```
 
-Select the `IOSLocalLLM` scheme and an iOS Simulator. For a physical device,
+Select the `OnDeviceLAS` scheme and an iOS Simulator. For a physical device,
 change the bundle identifiers and select your own development team in Xcode.
 See [SETUP_INSTRUCTIONS.md](SETUP_INSTRUCTIONS.md) and
 [fork configuration](Docs/FORK_CONFIGURATION.md) for every identifier,

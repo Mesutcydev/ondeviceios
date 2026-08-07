@@ -33,17 +33,24 @@ listener stops when iOS backgrounds the app.
 | Dialect | Method and route | Notes |
 | --- | --- | --- |
 | OpenAI | `GET /v1/models` | Lists locally available assistant models |
-| OpenAI | `POST /v1/chat/completions` | Text chat, streaming, and supported tool calls |
-| OpenAI | `POST /v1/responses` | Text input/output compatibility; no tool calling |
-| Anthropic | `POST /v1/messages` | Text messages and supported tool-use blocks |
+| OpenAI | `POST /v1/chat/completions` | Text/image chat, streaming, and supported tool calls |
+| OpenAI | `POST /v1/responses` | Text/image input and supported tool calls |
+| Anthropic | `POST /v1/messages` | Text/base64-image messages and supported tool-use blocks |
 | Ollama | `GET /api/tags` | Lists available models |
 | Ollama | `POST /api/show` | Returns local model information |
-| Ollama | `POST /api/chat` | Chat and supported tool definitions |
-| Ollama | `POST /api/generate` | Prompt-based text generation |
+| Ollama | `POST /api/chat` | Chat, base64 images, and supported tool definitions |
+| Ollama | `POST /api/generate` | Prompt-based generation with optional base64 images |
 
 Unsupported request options are rejected explicitly rather than silently
 ignored. The route implementation and decoding rules live in
 `IOSLocalLLM/Services/Bridge/LocalAPIServer.swift`.
+
+Image input is intentionally local-only. Send an embedded `data:image/...;base64`
+URL for OpenAI-compatible requests, an Anthropic base64 image source, or an
+Ollama `images` base64 value. The server does not fetch HTTP(S) image URLs,
+because network access must remain explicit and visible in the app. The active
+model must be a native MLX VLM or a GGUF model loaded beside its matching
+`mmproj-*.gguf` projector.
 
 ### OpenAI-compatible example
 
@@ -60,20 +67,55 @@ curl "$OPENAI_BASE_URL/chat/completions" \
   -d '{
     "model": "LOCAL_MODEL_ID",
     "messages": [{"role": "user", "content": "Explain this Swift error."}],
+    "max_completion_tokens": 4096,
+    "reasoning_effort": "none",
     "stream": false
   }'
 ```
 
 The requested model must be installed and must match a model ID or repository
-ID known to the app. Memory and thermal safety gates may refuse or shorten
-work even when a request is otherwise valid.
+ID known to the app. `max_tokens` and `max_completion_tokens` both set the
+visible completion budget; when both are present, `max_completion_tokens`
+wins. The accepted value is clamped to the active runtime's effective limit,
+which is published as `max_output_tokens` by `GET /v1/models`. Prompt/context
+tokens are budgeted separately from completion tokens.
+
+For Qwen3-family models, `reasoning_effort: "none"` is the recommended
+OpenAI-compatible no-thinking option. The compatibility decoder also accepts
+`enable_thinking: false`, `think: false`, and
+`chat_template_kwargs.enable_thinking: false`; these are normalized to the
+single model-aware chat-template option used by the runtime. Options are not
+forwarded blindly to model families that do not support them.
+
+OpenAI Chat Completions streaming uses `text/event-stream`. Every successful
+stream ends with a chunk containing `finish_reason` (`stop`, `length`, or
+`tool_calls`) followed by `data: [DONE]`. Set
+`stream_options.include_usage` to `true` to receive the final usage-only chunk.
+Non-stream responses always include exact `prompt_tokens`,
+`completion_tokens`, and `total_tokens` when the backend reports them. A
+deadline or disconnected client cancels its generation and does not emit a
+false successful stop.
+
+Reasoning models (Qwen3 / DeepSeek-R1-style parsers advertised as
+`reasoning_parser` on `/v1/models`) keep the same split in both modes:
+`reasoning_content` holds the chain of thought, and `content` holds only the
+final answer. Streaming emits those fields on `choices[0].delta` as tokens
+arrive; raw markers such as `<think>`, `</think>`, `<reasoning>`, and
+`</reasoning>` are stripped once parsing has started. Clients that only read
+`delta.content` therefore see the same clean answer they would get from a
+non-streaming completion.
+
+Memory and thermal safety gates may refuse a request. Because those limits can
+change while the device heats or cools, clients should query `/v1/models`
+again after a refusal rather than assuming a fixed output limit.
 
 ## Tool calling
 
-The OpenAI chat and Anthropic message decoders accept supported function/tool
+The OpenAI chat/Responses and Anthropic message decoders accept supported function/tool
 definitions and normalize them into the app's internal tool-call format.
-Tool-choice and parallel-call behavior differ by dialect. The Responses
-compatibility route is currently text-only.
+Tool-choice and parallel-call behavior differ by dialect. Embedded image parts
+remain attached while tool instructions are prepared, allowing a compatible
+vision model to inspect an image and emit native tool calls in the same turn.
 
 Treat a model's emitted tool call as untrusted input:
 

@@ -99,15 +99,42 @@ final class CoreAIModelStore: ObservableObject {
         preferredDisplayName: String?
     ) throws {
         state = .validating
+        do {
+            try performImport(
+                from: sourceURL,
+                preferredID: preferredID,
+                preferredDisplayName: preferredDisplayName
+            )
+        } catch {
+            refresh()
+            // Preserve a previously installed pack; otherwise surface the error.
+            if case .ready = state {} else {
+                state = .failed(error.localizedDescription)
+            }
+            throw error
+        }
+    }
+
+    private func performImport(
+        from sourceURL: URL,
+        preferredID: String?,
+        preferredDisplayName: String?
+    ) throws {
         let staging = modelDirectory.appendingPathComponent(".staging-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: staging) }
 
         let resources = staging.appendingPathComponent("resources", isDirectory: true)
-        if (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-            try FileManager.default.copyItem(at: sourceURL, to: resources)
+        let isDirectory = (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+        if isDirectory {
+            // Users often pick the Hub checkout root (`…/ios`, or a wrapper
+            // that still contains `resources/`). Copy the resolved pack root
+            // so metadata.json + .aimodel land directly under `resources/`.
+            let packRoot = Self.resolvePackRoot(from: sourceURL)
+            try FileManager.default.copyItem(at: packRoot, to: resources)
         } else {
-            guard sourceURL.pathExtension.lowercased() == "aimodel" else {
+            let ext = sourceURL.pathExtension.lowercased()
+            guard ext == "aimodel" || ext == "aimodelc" else {
                 throw CoreAIModelStoreError.invalidExtension
             }
             try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
@@ -129,6 +156,54 @@ final class CoreAIModelStore: ObservableObject {
         try FileManager.default.moveItem(at: staging, to: destination)
         UserDefaults.standard.set(manifest.version, forKey: Self.installedVersionKey)
         state = .ready(destination, manifest)
+    }
+
+    /// Prefer the directory that actually contains Core AI resources.
+    /// Accepts a bare resource tree, `resources/`, or `ios/`.
+    private static func resolvePackRoot(from sourceURL: URL) -> URL {
+        let fm = FileManager.default
+        func hasModelFiles(_ url: URL) -> Bool {
+            !((try? collectModelFiles(in: url)) ?? []).isEmpty
+        }
+        if fm.fileExists(atPath: sourceURL.appendingPathComponent("metadata.json").path) {
+            return sourceURL
+        }
+        if hasModelFiles(sourceURL) {
+            return sourceURL
+        }
+        let resources = sourceURL.appendingPathComponent("resources", isDirectory: true)
+        if fm.fileExists(atPath: resources.appendingPathComponent("metadata.json").path)
+            || hasModelFiles(resources) {
+            return resources
+        }
+        let ios = sourceURL.appendingPathComponent("ios", isDirectory: true)
+        if fm.fileExists(atPath: ios.appendingPathComponent("metadata.json").path)
+            || hasModelFiles(ios) {
+            return ios
+        }
+        // Nested Hub layouts: `<root>/<something>/resources`.
+        if let kids = try? fm.contentsOfDirectory(
+            at: sourceURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for kid in kids {
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: kid.path, isDirectory: &isDir), isDir.boolValue else {
+                    continue
+                }
+                if fm.fileExists(atPath: kid.appendingPathComponent("metadata.json").path)
+                    || hasModelFiles(kid) {
+                    return kid
+                }
+                let nested = kid.appendingPathComponent("resources", isDirectory: true)
+                if fm.fileExists(atPath: nested.appendingPathComponent("metadata.json").path)
+                    || hasModelFiles(nested) {
+                    return nested
+                }
+            }
+        }
+        return sourceURL
     }
 
     func download(from remoteURL: URL) {
@@ -246,11 +321,24 @@ final class CoreAIModelStore: ObservableObject {
         ) else { return [] }
         for case let url as URL in enumerator {
             let ext = url.pathExtension.lowercased()
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            // Official packs ship `.aimodel` as a directory bundle (main.mlirb +
+            // metadata) rather than a single file.
             if ext == "aimodel" || ext == "aimodelc" {
                 results.append(url)
+                if isDirectory {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            if !isDirectory, url.lastPathComponent.lowercased() == "main.mlirb" {
+                results.append(url.deletingLastPathComponent())
+                enumerator.skipDescendants()
             }
         }
-        return results
+        // De-dupe directory vs main.mlirb discoveries.
+        var seen = Set<String>()
+        return results.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }
 
     private func validate(manifest: CoreAIModelManifest, resourcesAt root: URL) throws {

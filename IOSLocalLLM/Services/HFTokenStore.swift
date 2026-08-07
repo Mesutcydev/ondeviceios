@@ -105,6 +105,7 @@ final class HFTokenStore: ObservableObject {
         ]
         let status = SecItemAdd(query as CFDictionary, nil)
         if status == errSecSuccess {
+            lastValidatedUsername = nil
             refresh()
             return true
         }

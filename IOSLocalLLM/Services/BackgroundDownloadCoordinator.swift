@@ -21,6 +21,17 @@ import Network
 final class BackgroundDownloadCoordinator: NSObject {
 
     static let shared = BackgroundDownloadCoordinator()
+    // Keep this background session private to the host app bundle. Reusing
+    // another app's identifier lets iOS hand the same session to two apps,
+    // which can deliver a completion into the wrong in-memory task map during
+    // the final multi-GB file handoff. OnDeviceLAS stays
+    // `com.mesutcydev.ondevicelas.background-downloads`; Core AI gets its
+    // own bundle-scoped id.
+    static let sessionIdentifier: String = {
+        let bundle = Bundle.main.bundleIdentifier ?? "com.mesutcydev.ondevicelas"
+        return "\(bundle).background-downloads"
+    }()
+    private static let inactivityTimeout: TimeInterval = 90
 
     // Public completion handler hook used by AppDelegate when iOS wakes us up
     // to deliver finished events. ContentView/App can wire this if needed.
@@ -30,7 +41,7 @@ final class BackgroundDownloadCoordinator: NSObject {
 
     private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.background(
-            withIdentifier: "com.mesutcydev.ioslocalllm.background-downloads"
+            withIdentifier: Self.sessionIdentifier
         )
         cfg.isDiscretionary = false
         cfg.sessionSendsLaunchEvents = true
@@ -42,6 +53,10 @@ final class BackgroundDownloadCoordinator: NSObject {
         cfg.allowsCellularAccess = !wifiOnly
         cfg.allowsExpensiveNetworkAccess = !wifiOnly
         cfg.waitsForConnectivity = true
+        // Keep the host connection policy explicit even though the model
+        // manager serializes file transfers; this avoids inheriting a more
+        // restrictive system default after a background-session restore.
+        cfg.httpMaximumConnectionsPerHost = 2
         return URLSession(configuration: cfg, delegate: self, delegateQueue: .main)
     }()
 
@@ -63,11 +78,15 @@ final class BackgroundDownloadCoordinator: NSObject {
 
     private struct Pending {
         let destination: URL
+        let sourceURL: URL
         let expectedSize: Int64
         let progress: (Int64, Int64) -> Void
         let continuation: CheckedContinuation<URL, Error>
+        var lastProgressAt: Date
     }
     private var pendingByTaskID: [Int: Pending] = [:]
+    private var watchdogs: [Int: Task<Void, Never>] = [:]
+    private var stalledTaskIDs: Set<Int> = []
 
     // MARK: - Public API
 
@@ -79,63 +98,126 @@ final class BackgroundDownloadCoordinator: NSObject {
         expectedSize: Int64,
         progress: @escaping (Int64, Int64) -> Void
     ) async throws -> URL {
-        return try await withCheckedThrowingContinuation { continuation in
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 60
-            // Attach HF token for huggingface.co downloads only — the
-            // coordinator is generic but the token must not leak to
-            // unrelated hosts (e.g. if the bundle ever fetches a
-            // CoreML model from a non-HF mirror). Host check is
-            // exact-suffix to also cover cdn-lfs.huggingface.co et al.
-            if let host = url.host?.lowercased(),
-               host == "huggingface.co" || host.hasSuffix(".huggingface.co") {
-                HFTokenStore.authorize(&request)
-            }
-
-            // Enforce "Wi-Fi only downloads" per task too — the session
-            // config can't change after creation, so a setting flipped
-            // mid-session would otherwise be ignored.
-            if AppSettings.shared.wifiOnlyDownloads {
-                request.allowsCellularAccess = false
-                request.allowsExpensiveNetworkAccess = false
-                if self.pathMonitor.currentPath.isExpensive {
-                    continuation.resume(throwing: NSError(
-                        domain: "HFDownload", code: -5,
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "Wi-Fi only downloads is on and this connection is cellular. Connect to Wi-Fi or turn the setting off in Settings → Models."]
-                    ))
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+                // A task-group child can be cancelled before its URLSession
+                // request is enqueued. Resume the continuation immediately
+                // in that case instead of leaving the child suspended.
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
                     return
                 }
-            }
 
-            // Resume an interrupted transfer when URLSession handed us
-            // resume data for this URL — otherwise a dropped multi-GB file
-            // restarted from byte 0. EXCEPTION: an authorized request can't be
-            // resumed. URLSession resume data does NOT re-encode request
-            // headers, so a resumed gated-HF download would drop the
-            // `Authorization: Bearer` token attached above and 401 mid-resume.
-            // When an auth header is present we discard the resume data and
-            // rebuild from the fresh authorized request; restarting beats a
-            // guaranteed auth failure. Public/non-HF downloads keep resume.
-            let hasAuthHeader = request.value(forHTTPHeaderField: "Authorization") != nil
-            let task: URLSessionDownloadTask
-            if !hasAuthHeader, let resumeData = Self.consumeResumeData(for: url) {
-                task = self.session.downloadTask(withResumeData: resumeData)
-            } else {
-                if hasAuthHeader { Self.clearResumeData(for: url) }
-                task = self.session.downloadTask(with: request)
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 60
+                // Attach HF token for huggingface.co downloads only — the
+                // coordinator is generic but the token must not leak to
+                // unrelated hosts (e.g. if the bundle ever fetches a
+                // CoreML model from a non-HF mirror). Host check is
+                // exact-suffix to also cover cdn-lfs.huggingface.co et al.
+                if let host = url.host?.lowercased(),
+                   host == "huggingface.co" || host.hasSuffix(".huggingface.co") {
+                    HFTokenStore.authorize(&request)
+                }
+
+                // Enforce "Wi-Fi only downloads" per task too — the session
+                // config can't change after creation, so a setting flipped
+                // mid-session would otherwise be ignored.
+                if AppSettings.shared.wifiOnlyDownloads {
+                    request.allowsCellularAccess = false
+                    request.allowsExpensiveNetworkAccess = false
+                    if self.pathMonitor.currentPath.isExpensive {
+                        continuation.resume(throwing: NSError(
+                            domain: "HFDownload", code: -5,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "Wi-Fi only downloads is on and this connection is cellular. Connect to Wi-Fi or turn the setting off in Settings → Models."]
+                        ))
+                        return
+                    }
+                }
+
+                // Resume an interrupted transfer when URLSession handed us
+                // resume data for this URL — otherwise a dropped multi-GB file
+                // restarted from byte 0. EXCEPTION: an authorized request can't be
+                // resumed. URLSession resume data does NOT re-encode request
+                // headers, so a resumed gated-HF download would drop the
+                // `Authorization: Bearer` token attached above and 401 mid-resume.
+                // When an auth header is present we discard the resume data and
+                // rebuild from the fresh authorized request; restarting beats a
+                // guaranteed auth failure. Public/non-HF downloads keep resume.
+                let hasAuthHeader = request.value(forHTTPHeaderField: "Authorization") != nil
+                let task: URLSessionDownloadTask
+                if !hasAuthHeader, let resumeData = Self.consumeResumeData(for: url) {
+                    task = self.session.downloadTask(withResumeData: resumeData)
+                } else {
+                    if hasAuthHeader { Self.clearResumeData(for: url) }
+                    task = self.session.downloadTask(with: request)
+                }
+                // The destination rides on the task itself so it survives an app
+                // relaunch — pendingByTaskID is in-memory only, and without this
+                // a download finishing after relaunch was deleted as untracked.
+                task.taskDescription = destination.path
+                self.pendingByTaskID[task.taskIdentifier] = Pending(
+                    destination: destination,
+                    sourceURL: url,
+                    expectedSize: expectedSize,
+                    progress: progress,
+                    continuation: continuation,
+                    lastProgressAt: Date()
+                )
+                self.watchdogs[task.taskIdentifier] = Task { @MainActor [weak self] in
+                    await self?.watchForStall(taskID: task.taskIdentifier)
+                }
+                task.resume()
             }
-            // The destination rides on the task itself so it survives an app
-            // relaunch — pendingByTaskID is in-memory only, and without this
-            // a download finishing after relaunch was deleted as untracked.
-            task.taskDescription = destination.path
-            self.pendingByTaskID[task.taskIdentifier] = Pending(
-                destination: destination,
-                expectedSize: expectedSize,
-                progress: progress,
-                continuation: continuation
-            )
-            task.resume()
+        }, onCancel: {
+            // Cancel the corresponding URLSession task too; otherwise network
+            // work can continue after the caller has already left the await.
+            Task { @MainActor [weak self] in
+                await self?.cancelTasks(
+                    matching: destination.path,
+                    producingResumeData: true
+                )
+            }
+        })
+    }
+
+    private func watchForStall(taskID: Int) async {
+        do {
+            while !Task.isCancelled {
+                try await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+                guard let pending = pendingByTaskID[taskID] else { return }
+                guard Date().timeIntervalSince(pending.lastProgressAt) >= Self.inactivityTimeout else {
+                    continue
+                }
+                stalledTaskIDs.insert(taskID)
+                RuntimeLogCenter.emit(
+                    "Transfer stalled for \(Int(Self.inactivityTimeout))s; saving resume data",
+                    level: .warning,
+                    subsystem: "download"
+                )
+                cancelTask(taskID, producingResumeData: true)
+                return
+            }
+        } catch {
+            // The task finished or was explicitly cancelled; its delegate
+            // callback owns continuation cleanup.
+        }
+    }
+
+    private func cancelTask(_ taskID: Int, producingResumeData: Bool) {
+        session.getAllTasks { tasks in
+            guard let task = tasks.first(where: { $0.taskIdentifier == taskID }) else { return }
+            if let downloadTask = task as? URLSessionDownloadTask, producingResumeData {
+                let sourceURL = downloadTask.originalRequest?.url ?? downloadTask.currentRequest?.url
+                downloadTask.cancel(byProducingResumeData: { resumeData in
+                    if let resumeData {
+                        Self.storeResumeData(resumeData, for: sourceURL)
+                    }
+                })
+            } else {
+                task.cancel()
+            }
         }
     }
 
@@ -146,7 +228,19 @@ final class BackgroundDownloadCoordinator: NSObject {
     // persisted to a temp sidecar keyed by a hash of the source URL, and
     // consumed by the next download() for the same URL.
 
-    private nonisolated static func resumeDataSidecar(for url: URL) -> URL {
+    private nonisolated static func persistentResumeDataSidecar(for url: URL) -> URL {
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        let name = digest.map { String(format: "%02x", $0) }.joined()
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let directory = documents.appendingPathComponent(".hf-resume", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        return directory.appendingPathComponent("hf-resume-\(name).dat")
+    }
+
+    private nonisolated static func legacyResumeDataSidecar(for url: URL) -> URL {
         let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
         let name = digest.map { String(format: "%02x", $0) }.joined()
         return FileManager.default.temporaryDirectory
@@ -155,21 +249,25 @@ final class BackgroundDownloadCoordinator: NSObject {
 
     nonisolated static func storeResumeData(_ data: Data, for url: URL?) {
         guard let url else { return }
-        try? data.write(to: resumeDataSidecar(for: url), options: [.atomic])
+        try? data.write(to: persistentResumeDataSidecar(for: url), options: [.atomic])
     }
 
     /// Returns persisted resume data for `url` (deleting the sidecar — it's
     /// single-use either way: consumed by the new task or invalid).
     nonisolated static func consumeResumeData(for url: URL) -> Data? {
-        let sidecar = resumeDataSidecar(for: url)
-        guard let data = try? Data(contentsOf: sidecar) else { return nil }
-        try? FileManager.default.removeItem(at: sidecar)
-        return data
+        for sidecar in [persistentResumeDataSidecar(for: url), legacyResumeDataSidecar(for: url)] {
+            if let data = try? Data(contentsOf: sidecar) {
+                try? FileManager.default.removeItem(at: sidecar)
+                return data
+            }
+        }
+        return nil
     }
 
     nonisolated static func clearResumeData(for url: URL?) {
         guard let url else { return }
-        try? FileManager.default.removeItem(at: resumeDataSidecar(for: url))
+        try? FileManager.default.removeItem(at: persistentResumeDataSidecar(for: url))
+        try? FileManager.default.removeItem(at: legacyResumeDataSidecar(for: url))
     }
 
     /// Total bytes held by abandoned URLSession resume sidecars. These are
@@ -197,13 +295,16 @@ final class BackgroundDownloadCoordinator: NSObject {
     }
 
     private nonisolated static func resumeDataSidecars() -> [URL] {
-        let temporary = FileManager.default.temporaryDirectory
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: temporary,
-            includingPropertiesForKeys: [.fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return entries.filter {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(".hf-resume", isDirectory: true)
+        let directories = [documents, FileManager.default.temporaryDirectory]
+        return directories.flatMap { directory in
+            (try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+        }.filter {
             $0.lastPathComponent.hasPrefix("hf-resume-") && $0.pathExtension == "dat"
         }
     }
@@ -215,17 +316,37 @@ final class BackgroundDownloadCoordinator: NSObject {
         }
     }
 
-    /// Cancels in-flight tasks whose pending destination path begins with the
-    /// given root. Used to abort one repo's downloads without stomping others.
-    func cancelTasks(matching destinationPrefix: String) async {
-        let matchingIDs = pendingByTaskID
-            .filter { $0.value.destination.path.hasPrefix(destinationPrefix) }
-            .map(\.key)
-
-        await withCheckedContinuation { continuation in
+    /// Cancels in-flight tasks whose task description points inside the given
+    /// destination. Matching taskDescription also covers transfers restored
+    /// by iOS after an app relaunch, when the in-memory pending map is empty.
+    func cancelTasks(
+        matching destinationPrefix: String,
+        producingResumeData: Bool = true
+    ) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             session.getAllTasks { tasks in
-                for task in tasks where matchingIDs.contains(task.taskIdentifier) {
-                    task.cancel()
+                for task in tasks {
+                    let taskPath = task.taskDescription ?? ""
+                    let matches = taskPath == destinationPrefix
+                        || taskPath.hasPrefix(destinationPrefix + "/")
+                    guard matches else { continue }
+                    if let downloadTask = task as? URLSessionDownloadTask,
+                       producingResumeData {
+                        let sourceURL = downloadTask.originalRequest?.url
+                            ?? downloadTask.currentRequest?.url
+                        downloadTask.cancel(byProducingResumeData: { resumeData in
+                            if let resumeData {
+                                Self.storeResumeData(resumeData, for: sourceURL)
+                            }
+                        })
+                    } else {
+                        if !producingResumeData {
+                            Self.clearResumeData(
+                                for: task.originalRequest?.url ?? task.currentRequest?.url
+                            )
+                        }
+                        task.cancel()
+                    }
                 }
                 continuation.resume()
             }
@@ -254,7 +375,10 @@ extension BackgroundDownloadCoordinator: URLSessionDownloadDelegate {
         // method already runs on the main thread. We can use
         // MainActor.assumeIsolated to access MainActor-isolated state safely.
         let pending: Pending? = MainActor.assumeIsolated {
-            self.pendingByTaskID.removeValue(forKey: taskID)
+            self.watchdogs[taskID]?.cancel()
+            self.watchdogs.removeValue(forKey: taskID)
+            self.stalledTaskIDs.remove(taskID)
+            return self.pendingByTaskID.removeValue(forKey: taskID)
         }
         // After an app relaunch the in-memory Pending map is gone, but the
         // destination was stored on the task itself (taskDescription) at
@@ -292,6 +416,11 @@ extension BackgroundDownloadCoordinator: URLSessionDownloadDelegate {
                 throwing: NSError(domain: "HFDownload", code: statusCode,
                                   userInfo: userInfo)
             )
+            RuntimeLogCenter.emit(
+                "HTTP \(statusCode) while downloading \(urlPath)",
+                level: .error,
+                subsystem: "download"
+            )
             return
         }
 
@@ -318,9 +447,14 @@ extension BackgroundDownloadCoordinator: URLSessionDownloadDelegate {
             FileManager.excludeFromBackup(destination)
             // The transfer finished — any stale resume data for this URL is
             // now useless.
-            Self.clearResumeData(for: downloadTask.originalRequest?.url
+            Self.clearResumeData(for: pending?.sourceURL
+                                       ?? downloadTask.originalRequest?.url
                                        ?? downloadTask.currentRequest?.url)
             pending?.continuation.resume(returning: destination)
+            RuntimeLogCenter.emit(
+                "Transfer finished: \(destination.lastPathComponent)",
+                subsystem: "download"
+            )
         } catch {
             try? fm.removeItem(at: location)
             pending?.continuation.resume(throwing: error)
@@ -335,7 +469,9 @@ extension BackgroundDownloadCoordinator: URLSessionDownloadDelegate {
         let taskID = downloadTask.taskIdentifier
         Task { @MainActor [weak self] in
             guard let self,
-                  let p = self.pendingByTaskID[taskID] else { return }
+                  var p = self.pendingByTaskID[taskID] else { return }
+            p.lastProgressAt = Date()
+            self.pendingByTaskID[taskID] = p
             let expected = totalBytesExpectedToWrite > 0
                 ? totalBytesExpectedToWrite : p.expectedSize
             p.progress(totalBytesWritten, expected)
@@ -356,17 +492,45 @@ extension BackgroundDownloadCoordinator: URLSessionDownloadDelegate {
         let taskID = task.taskIdentifier
         Task { @MainActor [weak self] in
             guard let self else { return }
+            self.watchdogs[taskID]?.cancel()
+            self.watchdogs.removeValue(forKey: taskID)
+            let wasStalled = self.stalledTaskIDs.remove(taskID) != nil
             if let p = self.pendingByTaskID.removeValue(forKey: taskID) {
-                p.continuation.resume(throwing: error)
+                let finalError: Error
+                if wasStalled {
+                    finalError = NSError(
+                        domain: "HFDownload",
+                        code: -6,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "The connection stopped transferring data. Resume will continue from the saved checkpoint."]
+                    )
+                } else {
+                    finalError = error
+                }
+                p.continuation.resume(throwing: finalError)
             }
         }
     }
 
     // Called when all background events have been delivered after a re-launch.
     nonisolated func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        RuntimeLogCenter.emit("Background download events delivered", subsystem: "download")
         Task { @MainActor [weak self] in
             self?.systemCompletionHandler?()
             self?.systemCompletionHandler = nil
         }
+    }
+}
+
+extension FileManager {
+    /// Marks `url` as excluded from iCloud/iTunes backups. Model weights are
+    /// large and re-downloadable; without this every downloaded model was
+    /// silently shipped into the user's backup. Setting the flag on a
+    /// directory covers everything beneath it.
+    static func excludeFromBackup(_ url: URL) {
+        var url = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? url.setResourceValues(values)
     }
 }

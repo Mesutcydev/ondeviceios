@@ -27,8 +27,8 @@ final class AppSettings: ObservableObject {
     /// a normal user only ever sees models that comfortably fit this device
     /// (full load-spike reserve kept), so they can't hit an OOM crash or an
     /// incompatible pick. When ON, "tight" models that sit right at the memory
-    /// ceiling are also surfaced and allowed to load — experimental, may be
-    /// unstable — for power users who knowingly want to run on the edge.
+    /// ceiling are also surfaced. GGUF can use its paging-aware edge path;
+    /// MLX keeps the fixed load reserve because its weights materialize eagerly.
     @AppStorage("showEdgeModels")          var showEdgeModels: Bool = false
     /// Experimental low-memory path for large local models. Imported GGUF
     /// weights stay mmap-backed with CPU execution; MLX uses a hard allocator
@@ -145,9 +145,25 @@ final class AppSettings: ObservableObject {
 
     // Local OpenAI / Ollama compatibility server. The access key is stored
     // separately in Keychain; only these non-secret preferences use defaults.
-    @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = false
+    @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = true
     @AppStorage("localAPIPort") var localAPIPort: Int = 11434
     @AppStorage("localAPIKeepScreenAwake") var localAPIKeepScreenAwake: Bool = true
+    @AppStorage("localAPIAutoLoadModel") var localAPIAutoLoadModel: Bool = false
+    /// Expose OpenAI/Anthropic/Ollama tool-call envelopes. When disabled,
+    /// incoming tool definitions are ignored and the model behaves as a text
+    /// completion endpoint.
+    @AppStorage("localAPIToolCallingEnabled") var localAPIToolCallingEnabled: Bool = true
+    /// Allow Qwen-style hidden reasoning during API generation. Reasoning
+    /// blocks are still removed from the protocol response for compatibility.
+    @AppStorage("localAPIReasoningEnabled") var localAPIReasoningEnabled: Bool = false
+    /// Permit one response to contain multiple independent tool calls.
+    @AppStorage("localAPIParallelToolCallsEnabled") var localAPIParallelToolCallsEnabled: Bool = true
+    /// User-selected ceiling for parallel tool calls. The active model
+    /// capability profile may apply a lower safety limit.
+    @AppStorage("localAPIParallelToolCallsLimit") var localAPIParallelToolCallsLimit: Int = 2
+    /// Validate model-produced arguments against the request's JSON schemas
+    /// before returning a call to Hermes or another client.
+    @AppStorage("localAPIStrictToolSchemasEnabled") var localAPIStrictToolSchemasEnabled: Bool = true
 
     // FastVLM pipeline
     // OCR fallback defaults OFF: the lens starts in visual (describe) mode, so
@@ -202,15 +218,24 @@ final class AppSettings: ObservableObject {
     // UI
     @AppStorage("showFPSCounter")          var showFPSCounter: Bool = true
     @AppStorage("hapticsEnabled")          var hapticsEnabled: Bool = true
-    /// "light", "dark", or "oled" — the palette switches accordingly. "oled"
-    /// is the Plum Dusk glass direction (see KoduTheme.oled).
-    @AppStorage("appearance")              var appearance: String = "light"
+    /// "system", "light", "dark", or "oled" — the palette switches accordingly.
+    /// "oled" is the Plum Dusk glass direction (see KoduTheme.oled).
+    @AppStorage("appearance")              var appearance: String = "system"
+    /// Selected brand-accent palette; the rawValue of `KoduTheme.KoduAccent`.
+    @AppStorage("themeAccent")             var themeAccent: String = KoduTheme.appAccent.rawValue
 
     /// SwiftUI color scheme for the chosen appearance. Both "dark" and "oled"
-    /// resolve to `.dark`; only "light" is light. Use this instead of an inline
+    /// resolve to `.dark`; only "light" is light. "system" resolves to nil so
+    /// the window follows the device setting. Use this instead of an inline
     /// `appearance == "dark" ? .dark : .light` so OLED doesn't fall through to
     /// light.
-    var resolvedColorScheme: ColorScheme { appearance == "light" ? .light : .dark }
+    var resolvedColorScheme: ColorScheme? {
+        switch appearance {
+        case "system": return nil
+        case "light":  return .light
+        default:       return .dark
+        }
+    }
     /// UI language override: "system" (follow device), "en", or "tr".
     /// Live-switchable via LocalizationService — see Settings → INTERFACE
     /// → language picker.
@@ -221,16 +246,7 @@ final class AppSettings: ObservableObject {
     /// are off. Off by default; toggle in Settings → INTERFACE.
     @AppStorage("showModelInputDebug")     var showModelInputDebug: Bool = false
 
-    // Voice / TTS
-    /// Compatibility proxies. VoiceSettingsStore owns persistence and migration.
-    @MainActor var voiceEngine: String {
-        get { VoiceSettingsStore.shared.selectedEngine.rawValue }
-        set { VoiceSettingsStore.shared.selectEngine(VoiceEngineKind(rawValue: newValue) ?? .appleSystem) }
-    }
-    @MainActor var voiceID: String {
-        get { VoiceSettingsStore.shared.selectedVoiceID }
-        set { VoiceSettingsStore.shared.selectVoice(newValue) }
-    }
+    // Voice / TTS preferences are intentionally not part of this target.
     /// Playback speed multiplier (0.5–2.0).
     @AppStorage("voiceSpeed")              var voiceSpeed: Double = 1.0
     /// Pitch multiplier (0.5–2.0).

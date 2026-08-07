@@ -1,0 +1,49 @@
+name: Model request
+description: Request a new model be added to the Core AI Models catalog.
+labels: ["model request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to request a new model. Linking to the original source helps us evaluate feasibility.
+  - type: input
+    id: source
+    attributes:
+      label: Source link
+      description: Hugging Face repo, GitHub release, paper, or other authoritative source for the model.
+      placeholder: https://huggingface.co/...
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Target platform
+      multiple: true
+      options:
+        - macOS
+        - iOS
+        - Both
+    validations:
+      required: true
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What do you want to build with this model? Helps us prioritize.
+    validations:
+      required: true
+  - type: input
+    id: precision
+    attributes:
+      label: Preferred precision / compression
+      description: Optional. e.g. `int4`, `mixed 4/8-bit`, `fp16`, or "no preference".
+      placeholder: mixed 4/8-bit
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Existing implementations, related models in the catalog, performance notes, or anything else relevant.
+    validations:
+      required: false

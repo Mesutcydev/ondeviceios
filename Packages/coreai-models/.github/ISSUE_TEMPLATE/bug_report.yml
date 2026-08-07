@@ -1,0 +1,63 @@
+name: Bug report
+description: Report something that does not work as expected in the Python scripts or Swift utilities.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. The more detail you provide, the faster we can triage.
+  - type: input
+    id: model
+    attributes:
+      label: Model name
+      description: Which model from `models/` is involved? (e.g. `qwen3`, `whisper`, `stable-diffusion`)
+      placeholder: qwen3
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run
+      description: The exact command or code that triggered the issue.
+      render: shell
+      placeholder: uv run coreai.model.registry --list-models
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: macOS / iOS target
+      description: OS version of the machine or device where the issue happens.
+      placeholder: macOS 27.0 beta 1 / iOS 27.0 beta 1
+    validations:
+      required: true
+  - type: input
+    id: xcode
+    attributes:
+      label: Xcode version
+      placeholder: Xcode 27.0 beta 1
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python / uv version
+      description: Only required if the issue is in the Python export tools. Output of `uv --version` and `python --version`.
+      placeholder: uv 0.5.0, Python 3.11.7
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Full error output
+      description: Paste the complete error output, including stack trace. Logs will be rendered as a code block.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Additional context, screenshots, or links that may help us reproduce.
+    validations:
+      required: false

@@ -1,0 +1,54 @@
+# See https://pre-commit.com for more information
+# To install: pre-commit install --hook-type pre-commit --hook-type pre-push
+# To update: pre-commit autoupdate
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: end-of-file-fixer
+        exclude: '\.mlir$'
+      - id: trailing-whitespace
+        exclude: '\.mlir$|\.swift$'
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: detect-private-key
+
+  # Python - Ruff (fast linter + formatter)
+  # Pinned to match the version in pyproject.toml's `lint` dependency group
+  # so pre-commit, CI, and local `uv run ruff` agree.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        exclude: lit.cfg.py$
+      - id: ruff-format
+
+  # Keep uv.lock in sync with pyproject.toml.
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.9.26
+    hooks:
+      - id: uv-lock
+
+  # Swift formatting (local - avoids SwiftPM unsafe flags issue)
+  - repo: local
+    hooks:
+      - id: swift-format
+        name: swift-format
+        entry: bash -c 'swift-format format --in-place --parallel "$@"' --
+        language: system
+        types: [swift]
+
+      - id: swift-format-lint
+        name: swift-format-lint
+        entry: bash -c 'swift-format lint --parallel "$@"' --
+        language: system
+        types: [swift]

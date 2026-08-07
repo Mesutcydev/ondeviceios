@@ -32,6 +32,12 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
       - name: Install locked CocoaPods dependencies
         run: pod install --deployment
 
@@ -72,8 +78,8 @@ jobs:
       - name: Build the iOS app for analysis
         run: |
           xcodebuild \
-            -workspace IOSLocalLLM.xcworkspace \
-            -scheme IOSLocalLLM \
+            -workspace OnDeviceLAS.xcworkspace \
+            -scheme OnDeviceLAS \
             -configuration Debug \
             -sdk iphonesimulator \
             -destination "generic/platform=iOS Simulator" \

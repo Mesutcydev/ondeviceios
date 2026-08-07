@@ -183,7 +183,11 @@ public enum ModelRuntime: String, Codable, Hashable, CaseIterable, Sendable {
     /// Short badge label shown on picker rows and result cards.
     var label: String {
         switch self {
+#if CORE_AI_SERVER_APP
+        case .mlx:      return "Core AI"
+#else
         case .mlx:      return "MLX"
+#endif
         case .llamaCpp: return "GGUF"
         }
     }
@@ -1210,7 +1214,9 @@ final class InstalledModelRegistry: ObservableObject {
         }
 
         // Detect engine
-        let engine: ModelRuntime = LocalModelFileValidator.hasValidGGUFTextModel(in: dir) ? .llamaCpp : .mlx
+        let engine: ModelRuntime = LocalModelFileValidator.hasValidGGUFTextModel(in: dir)
+            ? .llamaCpp
+            : .mlx
 
         // Detect capabilities
         var capabilities = Set<ModelCapability>()

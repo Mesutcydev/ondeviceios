@@ -4,6 +4,7 @@ Icon?
 
 # Xcode
 DerivedData/
+DerivedData-*/
 build/
 *.xcarchive
 *.ipa

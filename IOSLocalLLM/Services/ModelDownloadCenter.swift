@@ -148,6 +148,20 @@ final class DownloadableModel: ObservableObject, Identifiable {
     }
 
     func start() {
+        // Imported models use synthetic `local/<folder>` identities. They are
+        // already on disk and must never be interpreted as Hugging Face repos
+        // (which produced a guaranteed huggingface.co/local/... 404). Refresh
+        // readiness in case the row was built before import validation ended.
+        if sourceRepoID.lowercased().hasPrefix("local/") {
+            downloader?.checkIfReady()
+            if downloader?.state != .ready {
+                ToastCenter.shared.error(
+                    "Local model files need attention",
+                    detail: "Re-import this model from Files; local models cannot be downloaded from Hugging Face."
+                )
+            }
+            return
+        }
         if let compatibility = platformCompatibility,
            !compatibility.supportsCurrentPlatform {
             ToastCenter.shared.error(
@@ -168,6 +182,12 @@ final class DownloadableModel: ObservableObject, Identifiable {
         downloader?.start()
     }
     func cancel() { downloader?.cancel() }
+    func pause() { downloader?.pause() }
+    func resume() { downloader?.start() }
+    /// Permanently abandons an incomplete transfer and removes its partial
+    /// files. Kept separate from `cancel()` because older callers use cancel
+    /// as a pause-for-resume operation.
+    func cancelDownload() { downloader?.abandon() }
     func delete() throws { try downloader?.delete() }
     func redownload() { downloader?.redownload() }
     func checkIfReady() { downloader?.checkIfReady() }
@@ -540,8 +560,7 @@ final class ModelDownloadCenter: ObservableObject {
 
         if models.contains(where: { $0.id == repoID }) { return true }
 
-        let dirSize = (try? FileManager.default
-            .allocatedSizeOfDirectory(at: directory)) ?? 0
+        let dirSize = (try? FileManager.default.allocatedSizeOfDirectory(at: directory)) ?? 0
         let runtime: ModelRuntime? = LocalModelFileValidator.hasValidGGUFTextModel(in: directory)
             ? .llamaCpp
             : nil
@@ -997,16 +1016,6 @@ final class ModelDownloadCenter: ObservableObject {
             settings.hasPickedCameraVisualModel = false
         }
 
-        if let engine = model.supportedVoiceEngine,
-           settings.voiceEngine == engine.rawValue {
-            settings.voiceEngine = VoiceEngineKind.appleSystem.rawValue
-        }
-
-        if let variant = KittenVariant(rawValue: model.id),
-           VoiceSettingsStore.shared.selectedKittenVariant == variant {
-            VoiceService.shared.kittenEngine.unload()
-            VoiceSettingsStore.shared.selectEngine(.appleSystem)
-        }
     }
 
     // MARK: - Refresh
@@ -1242,19 +1251,6 @@ final class ModelDownloadCenter: ObservableObject {
 }
 
 // MARK: - FileManager+BackupExclusion
-
-extension FileManager {
-    /// Marks `url` as excluded from iCloud/iTunes backups. Model weights are
-    /// large and re-downloadable; without this every downloaded model was
-    /// silently shipped into the user's backup. Setting the flag on a
-    /// directory covers everything beneath it.
-    static func excludeFromBackup(_ url: URL) {
-        var url = url
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        try? url.setResourceValues(values)
-    }
-}
 
 // MARK: - FileManager+DirectorySize
 

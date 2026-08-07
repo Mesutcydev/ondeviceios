@@ -21,6 +21,8 @@ final class SystemStatusService: ObservableObject {
         var usedByApp: Int64 = 0
         var availableForML: Int64 = 0
         var freeRightNow: Int64 = 0
+        var hasIncreasedMemoryLimitEntitlement = false
+        var lowPowerModeEnabled = false
 
         // Disk
         var diskFree: Int64 = 0
@@ -49,6 +51,10 @@ final class SystemStatusService: ObservableObject {
 
     private var refreshTimer: Timer?
     private var subscriberCount = 0
+    private var cachedDiskFree: Int64 = 0
+    private var lastDiskRefreshAt = Date.distantPast
+    private var diskRefreshTask: Task<Void, Never>?
+    private let diskRefreshInterval: TimeInterval = 30
 
     private init() {
         refresh()
@@ -91,9 +97,11 @@ final class SystemStatusService: ObservableObject {
         snap.availableForML = MemoryAdvisor.availableMemoryForModel
         snap.freeRightNow   = MemoryAdvisor.processAvailableMemory
         snap.usedByApp      = MemoryAdvisor.physFootprint
+        snap.hasIncreasedMemoryLimitEntitlement = MemoryAdvisor.hasIncreasedMemoryLimitEntitlement
+        snap.lowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
 
         // Disk
-        snap.diskFree           = HFModelDownloadManager.freeDiskBytes() ?? 0
+        snap.diskFree           = cachedDiskFree
         snap.modelStorageUsed   = ModelDownloadCenter.shared.totalStorageUsed
 
         // Device
@@ -115,9 +123,8 @@ final class SystemStatusService: ObservableObject {
         // Runtime model state
         snap.qwen3Ready    = CodingAssistantService.shared.state == .ready
         snap.fastVLMReady  = FastVLMService.shared.componentStatus.canGenerate
-        snap.voiceEngineReady = VoiceService.shared.systemState == .ready
-                              || VoiceService.shared.kittenState == .ready
-                              || VoiceService.shared.kokoroState == .ready
+        // The server-only target does not load speech or TTS engines.
+        snap.voiceEngineReady = false
 
         // Perf (best-effort: pull last known)
         snap.lastFastVLMTPS = FastVLMService.shared.debugInfo?.lastTokensPerSecond
@@ -126,6 +133,31 @@ final class SystemStatusService: ObservableObject {
             : ModelUsageTracker.shared.lastTPS(for: "qwen3-4b")
 
         snapshot = snap
+        refreshDiskCapacityIfNeeded()
+    }
+
+    /// Volume resource values can block while iOS refreshes filesystem state.
+    /// Keep that work off the main actor and avoid repeating it on every
+    /// three-second health refresh; disk capacity does not need that cadence.
+    private func refreshDiskCapacityIfNeeded() {
+        guard diskRefreshTask == nil,
+              Date().timeIntervalSince(lastDiskRefreshAt) >= diskRefreshInterval else { return }
+
+        lastDiskRefreshAt = Date()
+        diskRefreshTask = Task { [weak self] in
+            let diskFree = await Task.detached(priority: .utility) {
+                HFModelDownloadManager.freeDiskBytes() ?? 0
+            }.value
+            guard !Task.isCancelled, let self else { return }
+
+            cachedDiskFree = diskFree
+            if snapshot.diskFree != diskFree {
+                var updated = snapshot
+                updated.diskFree = diskFree
+                snapshot = updated
+            }
+            diskRefreshTask = nil
+        }
     }
 
     // MARK: - Helpers

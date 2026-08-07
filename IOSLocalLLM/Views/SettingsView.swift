@@ -15,7 +15,7 @@ struct SettingsView: View {
 
     @State private var showingHFTokenSheet: Bool = false
     #if !targetEnvironment(macCatalyst)
-    /// nil = default "Neon" icon; "AppIconClassic" = previous pink mark.
+    /// nil = default monochrome LAS icon; "AppIconClassic" = previous pink mark.
     @State private var activeIconName: String? = UIApplication.shared.alternateIconName
     #endif
     /// Presents the onboarding model picker as a sheet so existing
@@ -1163,7 +1163,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             KMono(text: "app icon", size: 11.5, color: T.ink, mono: false)
             HStack(spacing: 14) {
-                appIconOption(name: nil, title: "Neon", preview: "AppIconPreview")
+                appIconOption(name: nil, title: "Monochrome", preview: "AppIconPreview")
                 appIconOption(name: "AppIconClassic", title: "Classic", preview: "AppIconClassicPreview")
                 Spacer()
             }
