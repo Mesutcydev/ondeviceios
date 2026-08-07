@@ -36,6 +36,7 @@ required_files=(
   llms.txt
   .github/CODEOWNERS
   .github/copilot-instructions.md
+  .github/workflows/codeql.yml
   .github/workflows/scorecard.yml
   .github/workflows/source-release.yml
   Packages/VoiceAgentOrb/LICENSE

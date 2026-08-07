@@ -10,6 +10,8 @@ accepted by any program.
 - Public contribution, conduct, security, governance, roadmap, maintainer, and
   release-policy documentation.
 - Automated repository hygiene and package tests.
+- CodeQL Swift security analysis on pull requests, `main`, and a weekly
+  schedule, with results published to GitHub code scanning.
 - OpenSSF Scorecard analysis with public results and code-scanning upload.
 - Reproducible source-release archives with checksums and GitHub/Sigstore
   provenance attestations.
